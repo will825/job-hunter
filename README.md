@@ -39,7 +39,34 @@ DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN
 ```
 To get a webhook: **Discord Server Settings → Integrations → Webhooks → New Webhook → Copy URL**
 
-### 3. Test run
+### 3. Customize your targets (optional)
+`config.py` ships with a small representative set of companies and keywords. To add your own without modifying the committed file, create a gitignored `config_local.py` in the same directory:
+
+```python
+# config_local.py — gitignored, never committed
+TARGET_COMPANIES = [
+    {"name": "Focusrite",  "ats": "greenhouse", "token": "focusrite"},
+    {"name": "Waves Audio","ats": "lever",       "token": "waves"},
+    # ... add as many as you like
+]
+
+KEYWORD_WEIGHTS = {
+    "audio dsp": 10,
+    "juce": 9,
+    "spatial audio": 9,
+    # ... your full keyword list
+}
+
+TITLE_BLOCKLIST = [
+    "recruiter",
+    "sales representative",
+    # ... roles to skip
+]
+```
+
+Any variable defined in `config_local.py` overrides the default in `config.py`. ATS tokens can be found at `boards.greenhouse.io/TOKEN`, `jobs.lever.co/TOKEN`, or `jobs.ashbyhq.com/TOKEN`.
+
+### 4. Test run
 ```bash
 # Dry run — scrape + score + print results, zero Discord messages
 python run.py --dry-run

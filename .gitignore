@@ -1,6 +1,9 @@
 # Secrets
 .env
 
+# Private config — personal keyword weights, company list, blocklist
+config_local.py
+
 # Database — append-only local store, not version controlled
 data/
 
