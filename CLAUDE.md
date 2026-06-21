@@ -6,7 +6,6 @@ Automated job-monitoring tool for Will (audio industry job seeker). Scrapes mult
 ## Tech Stack
 - **Python 3** — CLI script, no web framework
 - **SQLite** (`data/jobs.db`) — append-only audit log, never delete rows
-- **Playwright** — headless Chromium for LinkedIn scraping
 - **httpx** — HTTP client for ATS API calls
 - **BeautifulSoup4 + lxml** — HTML parsing
 - **feedparser** — RSS ingestion (RemoteOK, WeWorkRemotely)
@@ -23,7 +22,6 @@ job-hunter/
   verify_tokens.py    # Utility: check which ATS tokens are still returning 200s
   scrapers/
     company_ats.py       # Greenhouse / Lever / Ashby ATS API scrapers
-    linkedin_scraper.py  # Playwright-based LinkedIn job search
     avixa_scraper.py     # AVIXA Pro AV job board scraper
     remoteok_wwr.py      # RemoteOK + WeWorkRemotely RSS feeds
   notifiers/
@@ -52,7 +50,6 @@ job-hunter/
 | `KEYWORD_WEIGHTS` | `{"keyword phrase": weight}` — matched against title + description + company |
 | `TITLE_BLOCKLIST` | Title substrings that cause a job to be skipped entirely |
 | `TARGET_COMPANIES` | `[{name, ats, token}]` — all jobs from these companies are saved regardless of score |
-| `LINKEDIN_SEARCHES` | Search query strings fed to the LinkedIn scraper |
 
 ## CLI Usage
 ```bash
@@ -106,5 +103,4 @@ Many tokens in `config.py` are noted as potentially stale — 404s are logged gr
 ## Setup
 ```bash
 pip install -r requirements.txt
-playwright install chromium   # required for LinkedIn scraper
 ```

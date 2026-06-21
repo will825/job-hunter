@@ -377,12 +377,3 @@ JOB_BOARDS = [
     {"name": "NCWorks",             "url": "https://www.ncworks.gov",                         "priority": "MEDIUM"},
 ]
 
-# ─── LinkedIn Search Queries ─────────────────────────────────────────────────
-LINKEDIN_SEARCHES = [
-    "Audio Software Engineer",
-    "Solutions Engineer AV",
-    "DSP Engineer",
-    "Audio QA Engineer",
-    "Bioacoustics",
-    "Mycologist",
-]

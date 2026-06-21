@@ -27,7 +27,6 @@ scrape → score → deduplicate → alert
 ### 1. Install dependencies
 ```bash
 pip install -r requirements.txt
-playwright install chromium
 ```
 
 ### 2. Configure credentials
@@ -75,7 +74,6 @@ All tunable knobs live here. Edit this file, not the scrapers.
 | `KEYWORD_WEIGHTS` | `{"keyword phrase": weight}` — matched against title + description + company name |
 | `TITLE_BLOCKLIST` | Title substrings that cause a job to be skipped entirely |
 | `TARGET_COMPANIES` | `[{name, ats, token}]` — all jobs from these companies are saved, even at score 0 |
-| `LINKEDIN_SEARCHES` | Search strings used by the auxiliary search scraper |
 
 ### Score tiers (Discord embed colors)
 
@@ -99,7 +97,6 @@ job-hunter/
   verify_tokens.py    # Utility: audit which ATS tokens are still live
   scrapers/
     company_ats.py       # Greenhouse / Lever / Ashby ATS API scrapers
-    linkedin_scraper.py  # Auxiliary search scraper (Playwright)
     avixa_scraper.py     # AVIXA Pro AV job board
     remoteok_wwr.py      # RemoteOK + WeWorkRemotely RSS feeds
   notifiers/

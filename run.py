@@ -16,7 +16,6 @@ import scorer
 from notifiers import discord
 from scrapers import company_ats, remoteok_wwr
 from scrapers.avixa_scraper import scrape_avixa
-from scrapers.linkedin_scraper import scrape_linkedin
 
 logging.basicConfig(
     level=logging.INFO,
@@ -89,15 +88,6 @@ def main():
             all_raw.extend(avixa_jobs)
         except Exception as e:
             msg = f"AVIXA scraper failed: {e}"
-            logger.error(msg)
-            errors.append(msg)
-
-        try:
-            linkedin_jobs = scrape_linkedin()
-            all_raw.extend(linkedin_jobs)
-            logger.info("LinkedIn: %d jobs", len(linkedin_jobs))
-        except Exception as e:
-            msg = f"LinkedIn scraper failed: {e}"
             logger.error(msg)
             errors.append(msg)
 
