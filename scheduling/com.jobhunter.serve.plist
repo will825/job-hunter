@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.jobhunter.serve</string>
+
+    <!-- Always-on web dashboard. Starts at login, restarts if it stops.
+         Wrapped in `caffeinate -s -i` so the Mac won't system-sleep while the
+         server runs (the display can still sleep / screen off). -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-s</string>
+        <string>-i</string>
+        <string>/ABSOLUTE/PATH/TO/JobHunter/target/release/job_hunter</string>
+        <string>serve</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/ABSOLUTE/PATH/TO/JobHunter</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/ABSOLUTE/PATH/TO/JobHunter/serve.log</string>
+    <key>StandardErrorPath</key>
+    <string>/ABSOLUTE/PATH/TO/JobHunter/serve.log</string>
+</dict>
+</plist>

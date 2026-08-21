@@ -1,0 +1,69 @@
+# ──────────────────────────────────────────────────────────────
+#  Copy this file to `profile.toml` and make it yours.
+#  `profile.toml` is gitignored (it holds your name, email, etc.).
+#
+#  This single file drives the entire scoring engine: what counts
+#  as a match, which tier a job lands in, and what the AI compares
+#  each job description against.
+# ──────────────────────────────────────────────────────────────
+
+name = "Ada Lovelace"
+
+# The paragraph the LLM reads to judge fit. Write it about who you
+# are and what you want — a couple of honest sentences beat a
+# keyword dump.
+bio = """
+Backend engineer with a data/ML background, comfortable across the
+stack. Looking for backend, platform, or ML-engineering roles at
+climate, health, or developer-tools companies. Prefer remote.
+"""
+
+# The roles you're actively searching for. Strongest signal —
+# matched against job titles.
+target_roles = [
+    "backend engineer",
+    "platform engineer",
+    "software engineer",
+    "ml engineer",
+    "data engineer",
+]
+
+# Domains you care about (a moderate positive signal).
+interests = ["climate", "developer tools", "health tech", "data infrastructure"]
+
+[skills]
+# Your strongest, most differentiating skills (high weight).
+strong = ["python", "rust", "postgres", "kubernetes", "aws", "distributed systems"]
+# Supporting skills (moderate weight).
+medium = ["typescript", "react", "docker", "graphql", "airflow"]
+
+[preferences]
+# Preferred work modes; anything else is down-ranked (not hidden).
+work_modes = ["remote", "hybrid"]
+# Preferred regions (us, uk, emea, apac, canada, latam). Empty = no preference.
+regions = ["us"]
+# Phrases that strongly disqualify a role.
+dealbreakers = ["security clearance", "on-call 24/7"]
+
+# Optional: tune the point values. Defaults shown.
+[weights]
+target_role      = 12
+strong_skill     = 10
+medium_skill     = 4
+interest         = 6
+dealbreaker      = -14
+offmode_penalty  = -6
+offregion_penalty = -4
+
+# Optional: tune the score thresholds for each tier.
+[tiers]
+apply_now = 30
+strong    = 16
+maybe     = 6
+
+[email]
+enabled = true
+# Resend's shared sandbox sender works out of the box; swap for your
+# own verified domain to send from a custom address.
+from = "onboarding@resend.dev"
+to   = "you@example.com"

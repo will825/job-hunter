@@ -1,0 +1,762 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Job Hunter</title>
+<style>
+:root{color-scheme:light}*{box-sizing:border-box}
+html,body{overflow-x:clip;overscroll-behavior:none}
+body{
+  font:16px/1.55 -apple-system,"SF Pro Display",system-ui,sans-serif;margin:0;color:#1d1d1f;min-height:100vh;
+  background:
+    radial-gradient(46% 44% at 14% 7%, rgba(126,168,255,.85), transparent 56%),
+    radial-gradient(44% 42% at 90% 6%, rgba(196,158,255,.8), transparent 56%),
+    radial-gradient(54% 50% at 50% 100%, rgba(255,183,143,.68), transparent 60%),
+    radial-gradient(42% 44% at 1% 84%, rgba(148,232,198,.68), transparent 56%),
+    radial-gradient(40% 40% at 84% 74%, rgba(150,186,255,.62), transparent 56%),
+    radial-gradient(38% 38% at 34% 46%, rgba(206,182,255,.42), transparent 56%),
+    #e8eff9;
+  background-attachment:fixed;
+}
+header{background:transparent;border:none;padding:30px 26px 6px;max-width:1060px;margin:0 auto}
+h1{margin:0;font-size:30px;font-weight:700;letter-spacing:-.02em}
+.sub{color:#6b7280;font-size:14px;margin-top:3px}
+.wrap{max-width:1060px;margin:0 auto;padding:14px 26px 70px}
+.panel{
+  background:linear-gradient(150deg, rgba(255,255,255,.66), rgba(255,255,255,.42));
+  backdrop-filter:blur(34px) saturate(155%);-webkit-backdrop-filter:blur(34px) saturate(155%);
+  border:1px solid rgba(255,255,255,.75);border-radius:24px;
+  box-shadow:0 20px 48px rgba(40,55,90,.13), inset 0 1px 0 rgba(255,255,255,.65);
+  padding:24px 26px;margin-bottom:20px;
+}
+.panel.bare{background:transparent;backdrop-filter:none;-webkit-backdrop-filter:none;border:none;box-shadow:none;padding:6px 2px}
+.panel h2{margin:0 0 12px;font-size:15px;font-weight:600;display:flex;align-items:center;gap:8px;color:#1d1d1f}
+.muted{color:#6b7280;font-size:13px}
+input,select{
+  font:inherit;border-radius:12px;border:1px solid rgba(255,255,255,.7);background:rgba(255,255,255,.55);
+  color:#1d1d1f;padding:10px 13px;outline:none;transition:.15s;
+}
+input::placeholder{color:#9aa3af}
+input:focus,select:focus{border-color:rgba(10,132,255,.5);background:rgba(255,255,255,.85)}
+button{
+  font:inherit;font-weight:600;border-radius:14px;cursor:pointer;border:none;background:#0a84ff;color:#fff;
+  padding:11px 20px;box-shadow:0 8px 20px rgba(10,132,255,.30);transition:.15s;
+}
+@media(hover:hover){button:hover{background:#0a78e8}}
+button:disabled{opacity:.5;cursor:default;box-shadow:none}
+.addrow{display:flex;gap:10px}.addrow input{flex:1}
+.msg{margin-top:12px;font-size:13px;padding:10px 12px;border-radius:12px;display:none}
+.msg.ok{display:block;background:rgba(52,199,89,.15);color:#1a8a4a}
+.msg.err{display:block;background:rgba(255,90,80,.12);color:#c0392b}
+.chips{display:flex;flex-wrap:wrap;gap:9px;margin-top:4px}
+.chip{
+  display:flex;align-items:center;gap:6px;
+  background:linear-gradient(160deg, rgba(255,255,255,.75), rgba(255,255,255,.5));
+  border:1px solid rgba(255,255,255,.85);border-radius:16px;padding:7px 8px 7px 14px;
+  font-size:13px;font-weight:500;color:#1d1d1f;
+  box-shadow:0 3px 10px rgba(40,55,90,.07), inset 0 1px 0 rgba(255,255,255,.7);
+}
+.chip .ats{color:#0a84ff;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.4px}
+.chip button{background:transparent;border:none;color:#9aa3af;padding:0 4px;font-size:15px;line-height:1;box-shadow:none}
+.chip button:hover{color:#e0483d;background:transparent}
+.pgroup{margin-bottom:14px}
+.plabel{font-size:11px;color:#8a94a3;margin-bottom:7px;text-transform:uppercase;letter-spacing:.5px;font-weight:600}
+.reason{color:#6b7280;font-size:13.5px;margin-top:7px;line-height:1.45}
+.controls{display:flex;gap:9px;flex-wrap:wrap;margin-bottom:14px}
+.controls #q{flex:1;min-width:160px}
+.card{
+  background:linear-gradient(150deg, rgba(255,255,255,.62), rgba(255,255,255,.38));
+  backdrop-filter:blur(28px) saturate(165%);-webkit-backdrop-filter:blur(28px) saturate(165%);
+  border:1px solid rgba(255,255,255,.75);border-radius:22px;
+  box-shadow:0 18px 44px rgba(40,55,90,.14), inset 0 1px 0 rgba(255,255,255,.6);
+  padding:22px 24px;margin-bottom:0;display:flex;gap:18px;align-items:flex-start;
+  transition:transform .2s, box-shadow .2s;
+}
+@media(hover:hover){.card:hover{transform:translateY(-2px);box-shadow:0 26px 58px rgba(40,55,90,.2), inset 0 1px 0 rgba(255,255,255,.6)}}
+.cardactions{display:flex;flex-direction:column;gap:8px;flex:0 0 auto}
+.act{background:rgba(255,255,255,.55);border:1px solid rgba(255,255,255,.8);color:#4a5160;font:inherit;font-size:13.5px;font-weight:600;padding:8px 16px;border-radius:12px;cursor:pointer;box-shadow:none;transition:.15s;white-space:nowrap;text-align:center}
+@media(hover:hover){.act:hover{background:rgba(10,132,255,.12);color:#0a6fd0;border-color:transparent}}
+.act.on{background:rgba(10,132,255,.16);color:#0a6fd0;border-color:transparent}
+.act.done{background:rgba(52,199,89,.16);color:#1a8a4a;border-color:transparent;cursor:default}
+.act.x{color:#8a94a3}
+@media(hover:hover){.act.x:hover{background:rgba(255,90,80,.13);color:#c0392b}}
+/* --- Tracker board --- */
+.board{display:flex;gap:14px;align-items:flex-start;overflow-x:auto;padding-bottom:12px}
+.col{flex:1 1 220px;min-width:220px;background:linear-gradient(160deg,rgba(255,255,255,.5),rgba(255,255,255,.3));border:1px solid rgba(255,255,255,.6);border-radius:18px;padding:14px 12px;box-shadow:0 10px 28px rgba(40,55,90,.08),inset 0 1px 0 rgba(255,255,255,.6)}
+.colhead{font-size:12.5px;font-weight:700;color:#3a4150;text-transform:uppercase;letter-spacing:.4px;margin:2px 4px 12px;display:flex;align-items:center;gap:8px}
+.colcount{background:rgba(10,132,255,.14);color:#0a6fd0;font-size:11px;font-weight:700;padding:2px 8px;border-radius:10px}
+.collist{display:flex;flex-direction:column;gap:10px}
+.colempty{color:#aab2be;font-size:12.5px;text-align:center;padding:14px 0}
+.minicard{background:linear-gradient(160deg,rgba(255,255,255,.75),rgba(255,255,255,.55));border:1px solid rgba(255,255,255,.85);border-radius:14px;padding:11px 12px;box-shadow:0 4px 12px rgba(40,55,90,.07),inset 0 1px 0 rgba(255,255,255,.6)}
+.minitop{display:flex;align-items:flex-start;gap:8px}
+.miniscore{flex:0 0 auto;width:34px;height:34px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px;background:linear-gradient(160deg,rgba(130,140,155,.22),rgba(130,140,155,.12));color:#5b6675}
+.miniscore.scored{background:linear-gradient(160deg,rgba(10,132,255,.22),rgba(10,132,255,.12));color:#0a6fd0}
+.minititle{flex:1;min-width:0;font-size:13.5px;font-weight:600;color:#0a84ff;text-decoration:none;line-height:1.3}
+.minititle:hover{text-decoration:underline}
+.act.x.mini{padding:1px 6px;font-size:15px;border-color:transparent;background:transparent}
+.minico{color:#6b7280;font-size:12px;margin:7px 0 9px 42px}
+.mininote,.ministage{width:100%;font-size:12.5px;padding:7px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.75);background:rgba(255,255,255,.6);color:#1d1d1f;font-family:inherit}
+.mininote{margin-bottom:8px}
+/* --- Analytics --- */
+.tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:20px}
+.tile{background:linear-gradient(150deg,rgba(255,255,255,.66),rgba(255,255,255,.44));border:1px solid rgba(255,255,255,.75);border-radius:18px;box-shadow:0 12px 32px rgba(40,55,90,.1),inset 0 1px 0 rgba(255,255,255,.6);padding:18px 20px}
+.tilenum{font-size:30px;font-weight:700;letter-spacing:-.02em;color:#1d1d1f}
+.tilelbl{color:#6b7280;font-size:13px;margin-top:2px}
+.acards{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+.barrow{display:flex;align-items:center;gap:12px;margin:10px 0}
+.barlbl{flex:0 0 120px;font-size:13px;color:#3a4150;text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bartrack{flex:1;height:22px;background:rgba(120,130,155,.13);border-radius:11px;overflow:hidden}
+.barfill{height:100%;background:linear-gradient(90deg,#0a84ff,#5aabff);border-radius:11px;box-shadow:inset 0 1px 0 rgba(255,255,255,.3)}
+.barval{flex:0 0 auto;min-width:54px;font-size:13px;font-weight:600;color:#3a4150}
+.barsub{color:#9aa3af;font-weight:400}
+@media(max-width:900px){.tiles{grid-template-columns:repeat(2,1fr)}.acards{grid-template-columns:1fr}}
+.sc{
+  flex:0 0 auto;width:62px;height:62px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+  font-weight:700;font-size:21px;background:linear-gradient(160deg, rgba(130,140,155,.2), rgba(130,140,155,.1));color:#5b6675;
+  box-shadow:inset 0 0 0 1px rgba(255,255,255,.5), 0 4px 12px rgba(40,55,90,.08);
+}
+.sc.scored{
+  background:linear-gradient(160deg, rgba(10,132,255,.22), rgba(10,132,255,.1));color:#0a6fd0;
+  box-shadow:inset 0 0 0 1px rgba(10,132,255,.25), 0 5px 16px rgba(10,132,255,.18);
+}
+.card h3{margin:0 0 5px;font-size:17.5px;font-weight:600}
+.card a{color:#0a84ff;text-decoration:none}.card a:hover{text-decoration:underline}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;color:#6b7280;font-size:14px}
+.badge{padding:3px 9px;border-radius:20px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.4px}
+.apply_now{background:rgba(52,199,89,.16);color:#1a8a4a}.strong{background:rgba(10,132,255,.14);color:#0a6fd0}
+.maybe{background:rgba(255,180,20,.2);color:#b5820a}.skip{background:rgba(120,130,145,.15);color:#6b7280}
+.pill{background:rgba(255,255,255,.6);border:1px solid rgba(255,255,255,.7);color:#5b6675;padding:3px 9px;border-radius:20px;font-size:11.5px}
+.ai{background:rgba(52,199,89,.16) !important;color:#1a8a4a !important;border-color:transparent !important}
+.spin{display:inline-block;width:13px;height:13px;border:2px solid rgba(10,132,255,.3);border-top-color:#0a84ff;border-radius:50%;animation:s .7s linear infinite;vertical-align:-2px}
+@keyframes s{to{transform:rotate(360deg)}}
+/* --- App shell: sidebar nav + views --- */
+.app{display:flex;max-width:1560px;margin:0 auto;min-height:100vh}
+.sidebar{width:256px;flex:0 0 256px;position:sticky;top:0;height:100vh;padding:30px 18px;display:flex;flex-direction:column;gap:5px}
+.brand{font-size:23px;font-weight:700;letter-spacing:-.02em;padding:2px 12px 22px}
+.navitem{display:block;padding:12px 16px;border-radius:14px;color:#3a4150;font-weight:500;font-size:15.5px;cursor:pointer;text-decoration:none;transition:.15s;border:1px solid transparent}
+.navitem:hover{background:rgba(255,255,255,.5)}
+.navitem.active{background:linear-gradient(160deg,rgba(255,255,255,.82),rgba(255,255,255,.55));color:#0a6fd0;font-weight:600;border-color:rgba(255,255,255,.7);box-shadow:0 5px 16px rgba(40,55,90,.1),inset 0 1px 0 rgba(255,255,255,.75)}
+.spacer{flex:1}
+.sidebar .scan{width:100%;margin-top:6px;border-radius:14px}
+.scanmsg{font-size:12px;color:#5b6675;padding:8px 6px 0;text-align:center;line-height:1.35}
+.content{flex:1;min-width:0;padding:36px 52px 76px}
+.view{display:block}.view.hidden{display:none}
+#jobs,#savedJobs{display:grid;grid-template-columns:repeat(auto-fill,minmax(430px,1fr));gap:16px}
+#jobs .muted,#savedJobs .muted{grid-column:1/-1}
+.viewhead{font-size:29px;font-weight:700;letter-spacing:-.02em;margin:0 0 4px}
+.viewsub{color:#6b7280;font-size:15px;margin:0 0 24px}
+@media(max-width:840px){
+  .app{flex-direction:column}
+  .sidebar{width:auto;flex:none;height:auto;position:static;flex-direction:row;flex-wrap:wrap;align-items:center;padding:12px 14px;gap:6px}
+  .brand{width:100%;padding:2px 8px 8px;font-size:19px}
+  .spacer,.scanmsg{display:none}
+  .sidebar .scan{width:auto;margin:0 0 0 auto;padding:9px 16px}
+  .content{padding:18px 18px 50px}
+}
+/* --- Swipe view (Tinder mode) --- */
+.swipearea{max-width:520px;margin:8px auto 0;display:flex;flex-direction:column;align-items:center}
+.swipestack{position:relative;width:100%;height:470px}
+.swipecard{position:absolute;inset:0;background:linear-gradient(160deg,rgba(255,255,255,.74),rgba(255,255,255,.52));backdrop-filter:blur(30px) saturate(160%);-webkit-backdrop-filter:blur(30px) saturate(160%);border:1px solid rgba(255,255,255,.82);border-radius:26px;box-shadow:0 24px 60px rgba(40,55,90,.18),inset 0 1px 0 rgba(255,255,255,.7);padding:26px 28px;display:flex;flex-direction:column;cursor:grab;user-select:none;touch-action:pan-y;will-change:transform}
+.swipecard:active{cursor:grabbing}
+.swipecard.behind{transform:scale(.94) translateY(16px);filter:saturate(.92)}
+.swipetop{display:flex;align-items:center;gap:16px;margin-bottom:14px}
+.swipescore{flex:0 0 auto;width:68px;height:68px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:25px;background:linear-gradient(160deg,rgba(10,132,255,.22),rgba(10,132,255,.1));color:#0a6fd0;box-shadow:inset 0 0 0 1px rgba(10,132,255,.25)}
+.swipescore.plain{background:linear-gradient(160deg,rgba(130,140,155,.22),rgba(130,140,155,.12));color:#5b6675}
+.swipetitle{font-size:22px;font-weight:700;line-height:1.2;letter-spacing:-.01em}
+.swipeco{color:#6b7280;font-size:15px;margin-top:3px}
+.swipetags{display:flex;flex-wrap:wrap;gap:7px;margin:4px 0 14px}
+.swipereason{color:#3a4150;font-size:15px;line-height:1.5;flex:1;overflow:auto}
+.swipelink{margin-top:14px;font-size:14px}
+.swipehint{position:absolute;top:28px;padding:6px 16px;border-radius:12px;font-weight:800;font-size:22px;letter-spacing:1px;border:3px solid;opacity:0}
+.swipehint.like{right:26px;color:#1a8a4a;border-color:#1a8a4a;transform:rotate(-12deg)}
+.swipehint.nope{left:26px;color:#c0392b;border-color:#c0392b;transform:rotate(12deg)}
+.swipebtns{display:flex;gap:16px;margin-top:26px;align-items:center}
+.sbtn{border-radius:16px;padding:13px 30px;font-size:15px;font-weight:700;cursor:pointer;border:1px solid rgba(255,255,255,.8);background:linear-gradient(160deg,rgba(255,255,255,.82),rgba(255,255,255,.6));box-shadow:0 8px 20px rgba(40,55,90,.1),inset 0 1px 0 rgba(255,255,255,.7)}
+.sbtn.nope{color:#c0392b}.sbtn.like{color:#1a8a4a}.sbtn.undo{color:#5b6675;padding:13px 22px}
+@media(hover:hover){.sbtn:hover{filter:brightness(1.05)}}
+.sbtn:focus{outline:none}
+.swipedone{text-align:center;color:#6b7280;padding:70px 20px;font-size:16px;line-height:1.6}
+/* --- Undo toast --- */
+.toast{position:fixed;bottom:26px;left:50%;transform:translateX(-50%) translateY(160%);background:rgba(28,32,42,.92);backdrop-filter:blur(14px) saturate(160%);-webkit-backdrop-filter:blur(14px) saturate(160%);color:#fff;padding:12px 14px 12px 18px;border-radius:16px;box-shadow:0 16px 40px rgba(0,0,0,.28);display:flex;align-items:center;gap:16px;font-size:14px;font-weight:500;z-index:200;transition:transform .28s cubic-bezier(.2,.8,.2,1);max-width:92vw}
+.toast.show{transform:translateX(-50%) translateY(0)}
+.toast .tmsg{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:60vw}
+.toast button{background:rgba(255,255,255,.22);border:none;color:#fff;font-weight:700;padding:7px 16px;border-radius:11px;cursor:pointer;font-size:13px;box-shadow:none}
+@media(hover:hover){.toast button:hover{background:rgba(255,255,255,.34)}}
+</style>
+</head>
+<body>
+<div class="app">
+  <nav class="sidebar">
+    <div class="brand">Job Hunter</div>
+    <a class="navitem active" data-view="home">Home</a>
+    <a class="navitem" data-view="swipe">Swipe</a>
+    <a class="navitem" data-view="tracker">Tracker</a>
+    <a class="navitem" data-view="analytics">Analytics</a>
+    <a class="navitem" data-view="profile">Profile</a>
+    <a class="navitem" data-view="companies">Watched companies</a>
+    <a class="navitem" data-view="email">Digest email</a>
+    <a class="navitem" data-view="settings">Settings</a>
+    <div class="spacer"></div>
+    <button id="scanBtn" class="scan" onclick="scan()">Scan now</button>
+    <div id="scanMsg" class="scanmsg"></div>
+  </nav>
+
+  <main class="content">
+
+    <section id="view-home" class="view">
+      <h1 class="viewhead">Your matches</h1>
+      <p class="viewsub">Jobs ranked to your profile — best first.</p>
+      <div class="controls">
+        <input id="q" placeholder="Search title / company…" oninput="loadJobs()" />
+        <select id="tier" onchange="loadJobs()"><option value="">All tiers</option><option value="apply_now">Apply now</option><option value="strong">Strong</option><option value="maybe">Maybe</option><option value="skip">Skip</option></select>
+        <select id="work_mode" onchange="loadJobs()"><option value="">Any mode</option><option>remote</option><option>hybrid</option><option>onsite</option></select>
+        <select id="region" onchange="loadJobs()"><option value="">Any region</option><option value="us">US</option><option value="uk">UK</option><option value="emea">EMEA</option><option value="apac">APAC</option><option value="canada">Canada</option><option value="latam">LATAM</option></select>
+        <select id="seniority" onchange="loadJobs()"><option value="">Any level</option><option>junior</option><option>mid</option><option>senior</option><option>staff</option><option>lead</option></select>
+        <select id="sort" onchange="loadJobs()"><option value="best">Sort: Best match</option><option value="newest">Sort: Newest</option><option value="company">Sort: Company A–Z</option></select>
+      </div>
+      <div id="jobsCount" class="muted" style="margin-bottom:10px"></div>
+      <div id="jobs"></div>
+    </section>
+
+    <section id="view-swipe" class="view hidden">
+      <h1 class="viewhead">Swipe <span style="font-size:14px;font-weight:500;color:#8a94a3">— test mode</span></h1>
+      <p class="viewsub">One job at a time. Drag right to save, left to pass — or use the buttons.</p>
+      <div class="swipearea">
+        <div id="swipeStack" class="swipestack"></div>
+        <div class="swipebtns">
+          <button class="sbtn nope" onclick="swipeCommit('dismissed')">Pass</button>
+          <button class="sbtn undo" onclick="swipeUndo()">Undo</button>
+          <button class="sbtn like" onclick="swipeCommit('saved')">Save</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="view-tracker" class="view hidden">
+      <h1 class="viewhead">Application tracker</h1>
+      <p class="viewsub">Save jobs from Home, then move them through your pipeline. Add notes as you go.</p>
+      <div id="board" class="board"></div>
+    </section>
+
+    <section id="view-analytics" class="view hidden">
+      <h1 class="viewhead">Analytics</h1>
+      <p class="viewsub">Your search at a glance — the funnel fills out as you use the tracker.</p>
+      <div id="analytics"></div>
+    </section>
+
+    <section id="view-profile" class="view hidden">
+      <h1 class="viewhead">Profile</h1>
+      <p class="viewsub">What to look for — applies on the next scan.</p>
+      <div class="panel">
+        <h2>Auto-fill from your resume</h2>
+        <div class="muted">Upload one or more resumes (PDF) — got several that highlight different skills? Select them all. AI reads each into the roles, skills, and interests below.</div>
+        <div class="addrow" style="margin-top:12px">
+          <input type="file" id="resumeFile" accept=".pdf,.txt" multiple style="flex:1">
+          <button id="resumeBtn" onclick="uploadResume()">Upload</button>
+        </div>
+        <div id="resumeMsg" class="msg"></div>
+      </div>
+      <div class="panel">
+        <div class="pgroup">
+          <div class="plabel">Roles you're looking for</div>
+          <div class="addrow"><input id="roleInput" placeholder="e.g. audio DSP engineer" onkeydown="if(event.key==='Enter')addP('roles','roleInput')"><button onclick="addP('roles','roleInput')">Add</button></div>
+          <div id="rolesChips" class="chips" style="margin-top:8px"></div>
+        </div>
+        <div class="pgroup">
+          <div class="plabel">Skills</div>
+          <div class="addrow"><input id="skillInput" placeholder="e.g. wgpu" onkeydown="if(event.key==='Enter')addP('skills','skillInput')"><button onclick="addP('skills','skillInput')">Add</button></div>
+          <div id="skillsChips" class="chips" style="margin-top:8px"></div>
+        </div>
+        <div class="pgroup">
+          <div class="plabel">Interests</div>
+          <div class="addrow"><input id="interestInput" placeholder="e.g. spatial audio" onkeydown="if(event.key==='Enter')addP('interests','interestInput')"><button onclick="addP('interests','interestInput')">Add</button></div>
+          <div id="interestsChips" class="chips" style="margin-top:8px"></div>
+        </div>
+        <div class="muted">Adding a role also makes Adzuna search the whole internet for it on the next scan.</div>
+      </div>
+    </section>
+
+    <section id="view-companies" class="view hidden">
+      <h1 class="viewhead">Watched companies</h1>
+      <p class="viewsub">Boards and aggregators scanned for you.</p>
+      <div class="panel">
+        <h2>Add a company board</h2>
+        <div class="muted">Paste a careers-page or job-board link (Greenhouse, Lever, or Ashby). It'll detect the board and add it — or tell you if it's not supported.</div>
+        <div class="addrow" style="margin-top:10px">
+          <input id="url" placeholder="https://boards.greenhouse.io/acme  or  https://acme.com/careers" />
+          <button id="addBtn" onclick="addCompany()">Add</button>
+        </div>
+        <div id="addMsg" class="msg"></div>
+      </div>
+      <div class="panel">
+        <h2>Watching <span id="coCount" class="muted"></span></h2>
+        <div id="companies" class="chips"><span class="muted">Loading…</span></div>
+      </div>
+    </section>
+
+    <section id="view-email" class="view hidden">
+      <h1 class="viewhead">Digest email</h1>
+      <p class="viewsub">Get your new matches emailed to you each morning — via Resend (free).</p>
+      <div class="panel">
+        <label style="display:flex;align-items:center;gap:8px;margin:0 0 14px">
+          <input type="checkbox" id="emailEnabled" style="width:16px;height:16px"> <span>Enable email digest</span>
+        </label>
+        <div class="pgroup">
+          <div class="plabel">Send digest to (your email)</div>
+          <input id="emailTo" placeholder="you@example.com" style="width:100%">
+        </div>
+        <div class="pgroup">
+          <div class="plabel">From address</div>
+          <input id="emailFrom" placeholder="onboarding@resend.dev" style="width:100%">
+          <div class="muted" style="margin-top:4px">Leave as <code>onboarding@resend.dev</code> to email yourself with no setup. Use your own domain once you verify one in Resend.</div>
+        </div>
+        <button onclick="saveEmail()">Save email settings</button>
+        <span id="emailMsg" class="muted" style="margin-left:8px"></span>
+        <div id="pwNote" class="msg" style="margin-top:12px"></div>
+      </div>
+    </section>
+
+    <section id="view-settings" class="view hidden">
+      <h1 class="viewhead">Settings</h1>
+      <p class="viewsub">How Job Hunter runs.</p>
+      <div class="panel">
+        <h2>Daily schedule</h2>
+        <div class="muted">A scan runs automatically every morning at 7:00 AM and emails you new matches. Your Mac just needs to be on and logged in — the screen can be off.</div>
+      </div>
+      <div class="panel">
+        <h2>Advanced tuning</h2>
+        <div class="muted">Fine-tune scoring weights, tier thresholds, and API keys in <code>profile.toml</code> and <code>.env</code> in the project folder.</div>
+      </div>
+      <div class="panel">
+        <h2>About</h2>
+        <div class="muted">Job Hunter scans company boards and aggregators, ranks each job against your profile with AI, and surfaces your best matches — all locally on your machine.</div>
+      </div>
+    </section>
+
+  </main>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => (s||'').replace(/[&<>]/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[m]));
+
+async function loadCompanies(){
+  const r = await fetch('/api/companies'); const d = await r.json();
+  const el = $('companies');
+  const list = d.companies || [];
+  $('coCount').textContent = list.length ? `(${list.length})` : '';
+  if(!list.length){ el.innerHTML = '<span class="muted">No companies yet — add one above.</span>'; return; }
+  el.innerHTML = list.map(c =>
+    `<span class="chip"><span class="ats">${esc(c.ats)}</span> ${esc(c.token)}<button title="Remove" onclick="del(${c.id})">×</button></span>`
+  ).join('');
+}
+
+async function addCompany(){
+  const url = $('url').value.trim();
+  const msg = $('addMsg'); msg.className='msg';
+  if(!url){ return; }
+  $('addBtn').disabled = true; $('addBtn').innerHTML = '<span class="spin"></span>';
+  try{
+    const r = await fetch('/api/companies', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({url})});
+    const d = await r.json();
+    if(r.ok){ msg.className='msg ok'; msg.textContent = d.message || 'Added.'; $('url').value=''; loadCompanies(); }
+    else { msg.className='msg err'; msg.textContent = d.error || 'Could not add that link.'; }
+  }catch(e){ msg.className='msg err'; msg.textContent = 'Network error.'; }
+  $('addBtn').disabled = false; $('addBtn').textContent = 'Add';
+}
+
+async function del(id){
+  await fetch('/api/companies/'+id, {method:'DELETE'});
+  loadCompanies();
+}
+
+async function scan(){
+  const btn = $('scanBtn'), msg = $('scanMsg');
+  btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Scanning…';
+  msg.textContent = 'Fetching every board — this can take ~20s.';
+  try{
+    const r = await fetch('/api/scan', {method:'POST'});
+    const d = await r.json();
+    if(r.ok){ msg.textContent = `Done — ${d.total_fetched} fetched, ${d.inserted} new, ${d.total_in_db} total (${d.boards_failed} board(s) failed).`; loadJobs(); }
+    else { msg.textContent = d.error || 'Scan failed.'; }
+  }catch(e){ msg.textContent = 'Scan error.'; }
+  btn.disabled = false; btn.textContent = 'Scan now';
+}
+
+function cardHtml(j, ctx){
+  const hasAi = j.llm_score !== null && j.llm_score !== undefined;
+  const score = hasAi ? j.llm_score : j.keyword_score;
+  const aiTag = hasAi ? '<span class="pill ai">AI fit</span>' : '';
+  const reason = (hasAi && j.llm_reasoning) ? `<div class="reason">${esc(j.llm_reasoning)}</div>` : '';
+  const saved = j.status === 'saved';
+  let actions;
+  if(ctx === 'applied'){
+    actions = `<span class="act done">Applied</span>
+       <button class="act x" onclick="jobAction('${j.id}','active',event)" title="Move back to matches">Undo</button>`;
+  } else if(ctx === 'saved'){
+    actions = `<button class="act" onclick="jobAction('${j.id}','applied',event)" title="Mark as applied">Applied</button>
+       <button class="act x" onclick="jobAction('${j.id}','active',event)" title="Remove from saved">Remove</button>`;
+  } else {
+    actions = `<button class="act${saved?' on':''}" onclick="jobAction('${j.id}','saved',event)" title="Save">${saved?'Saved':'Save'}</button>
+       <button class="act" onclick="jobAction('${j.id}','applied',event)" title="Mark as applied">Applied</button>
+       <button class="act x" onclick="jobAction('${j.id}','dismissed',event)" title="Dismiss">×</button>`;
+  }
+  return `<div class="card"><div class="sc${hasAi?' scored':''}">${score}</div>
+    <div style="flex:1;min-width:0">
+      <h3><a href="${j.url}" target="_blank" rel="noopener">${esc(j.title)}</a></h3>
+      <div class="row"><span class="badge ${j.tier}">${j.tier.replace('_',' ')}</span>${aiTag}
+      <span class="pill">${esc(j.company)}</span><span class="pill">${j.work_mode}</span>
+      <span class="pill">${j.region}</span><span class="pill">${j.seniority}</span>
+      <span style="color:#6b7480">${esc(j.location)}</span></div>
+      ${reason}
+    </div>
+    <div class="cardactions">${actions}</div>
+  </div>`;
+}
+
+let lastUndo = null;
+async function jobAction(id, status, ev){
+  if(ev) ev.stopPropagation();
+  const card = ev && ev.target.closest('.card');
+  const onHome = currentView !== 'tracker' && !!card;
+  // Grab the title + a clean copy of the card now, before it animates away.
+  let title = 'job', html = null;
+  if(card){ const a = card.querySelector('h3 a'); if(a) title = a.textContent; html = card.outerHTML; }
+
+  await fetch('/api/jobs/status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,status})});
+
+  if(currentView==='tracker'){ loadTracker(); return; }
+  if(onHome){
+    // Fly the card: right = saved, left = dismissed, up = applied.
+    const dir = status==='saved' ? 'right' : status==='applied' ? 'up' : 'left';
+    lastUndo = { id, html, dir };
+    flyOut(card, dir, updateJobsCount);
+    const verb = status==='saved' ? 'Saved' : status==='applied' ? 'Marked applied' : 'Dismissed';
+    showToast(`${verb}: ${title}`, undoLast);
+  } else {
+    loadJobs();
+  }
+}
+
+function updateJobsCount(){
+  const n = document.querySelectorAll('#jobs .card').length;
+  $('jobsCount').textContent = `${n} shown`;
+  if(n === 0) loadJobs();
+}
+
+function offscreen(dir){
+  return dir==='right' ? 'translateX(135%) rotate(9deg)'
+       : dir==='left'  ? 'translateX(-135%) rotate(-9deg)'
+       :                 'translateY(-130%) scale(.95)';
+}
+
+function flyOut(card, dir, done){
+  card.style.pointerEvents = 'none';
+  card.style.zIndex = '5';
+  card.style.transition = 'transform .55s cubic-bezier(.25,.6,.3,1), opacity .55s ease';
+  requestAnimationFrame(() => { card.style.transform = offscreen(dir); card.style.opacity = '0'; });
+  setTimeout(() => { card.remove(); if(done) done(); }, 560);
+}
+
+let toastTimer;
+function getToast(){
+  let t = document.getElementById('toast');
+  if(!t){ t = document.createElement('div'); t.id = 'toast'; t.className = 'toast'; document.body.appendChild(t); }
+  return t;
+}
+function showToast(msg, undoFn){
+  const t = getToast();
+  t.innerHTML = `<span class="tmsg">${esc(msg)}</span><button>Undo</button>`;
+  t.querySelector('button').onclick = () => { if(undoFn) undoFn(); hideToast(); };
+  requestAnimationFrame(() => t.classList.add('show'));
+  clearTimeout(toastTimer); toastTimer = setTimeout(hideToast, 5000);
+}
+function hideToast(){ const t = document.getElementById('toast'); if(t) t.classList.remove('show'); }
+async function undoLast(){
+  if(!lastUndo) return;
+  const { id, html, dir } = lastUndo; lastUndo = null;
+  await fetch('/api/jobs/status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,status:'active'})});
+  const jobs = $('jobs');
+  const tmp = document.createElement('div'); tmp.innerHTML = html.trim();
+  const card = tmp.firstElementChild;
+  if(!card){ loadJobs(); return; }
+  // Start it off-screen on the side it flew to, then glide it back in.
+  card.style.transition = 'none';
+  card.style.pointerEvents = ''; card.style.zIndex = '';
+  card.style.opacity = '0';
+  card.style.transform = offscreen(dir);
+  jobs.insertBefore(card, jobs.firstChild);
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    card.style.transition = 'transform .55s cubic-bezier(.25,.7,.3,1), opacity .4s ease';
+    card.style.transform = 'none'; card.style.opacity = '1';
+  }));
+  updateJobsCount();
+}
+
+async function loadJobs(){
+  const p = new URLSearchParams();
+  for(const k of ['q','tier','work_mode','region','seniority','sort']){ const v=$(k).value; if(v) p.set(k,v); }
+  p.set('limit','300');
+  const r = await fetch('/api/jobs?'+p.toString()); const d = await r.json();
+  const list = d.jobs || [];
+  $('jobsCount').textContent = `${list.length} shown`;
+  $('jobs').innerHTML = list.map(j => cardHtml(j,'home')).join('')
+    || '<div class="muted">No matches yet — add companies and hit “Scan now”.</div>';
+}
+
+const STAGES = [
+  {key:'saved', label:'Saved'},
+  {key:'applied', label:'Applied'},
+  {key:'interviewing', label:'Interviewing'},
+  {key:'offer', label:'Offer'},
+  {key:'rejected', label:'Rejected'},
+];
+const escAttr = s => esc(s).replace(/"/g,'&quot;');
+
+async function loadTracker(){
+  const r = await fetch('/api/tracker'); const d = await r.json();
+  const groups = {}; STAGES.forEach(s => groups[s.key] = []);
+  (d.jobs||[]).forEach(j => { if(groups[j.status]) groups[j.status].push(j); });
+  $('board').innerHTML = STAGES.map(s => {
+    const cards = groups[s.key].map(trackerCard).join('') || '<div class="colempty">Nothing here yet</div>';
+    return `<div class="col"><div class="colhead">${s.label} <span class="colcount">${groups[s.key].length}</span></div><div class="collist">${cards}</div></div>`;
+  }).join('');
+}
+
+function trackerCard(j){
+  const hasAi = j.llm_score !== null && j.llm_score !== undefined;
+  const score = hasAi ? j.llm_score : j.keyword_score;
+  const opts = STAGES.map(s => `<option value="${s.key}"${s.key===j.status?' selected':''}>${s.label}</option>`).join('');
+  return `<div class="minicard">
+    <div class="minitop">
+      <span class="miniscore${hasAi?' scored':''}">${score}</span>
+      <a href="${j.url}" target="_blank" rel="noopener" class="minititle">${esc(j.title)}</a>
+      <button class="act x mini" onclick="jobAction('${j.id}','active',event)" title="Remove from tracker">×</button>
+    </div>
+    <div class="minico">${esc(j.company)}</div>
+    <input class="mininote" placeholder="Add a note…" value="${escAttr(j.note||'')}" onchange="saveNote('${j.id}',this.value)">
+    <select class="ministage" onchange="jobAction('${j.id}',this.value,event)">${opts}</select>
+  </div>`;
+}
+
+async function saveNote(id, note){
+  await fetch('/api/jobs/note',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,note})});
+}
+
+// --- Swipe (Tinder) mode ---
+let swipeJobs = [], swipeIdx = 0, swipeHist = [];
+async function loadSwipe(){
+  const d = await (await fetch('/api/jobs?limit=100&sort=best')).json();
+  swipeJobs = d.jobs || []; swipeIdx = 0; swipeHist = [];
+  renderSwipe();
+}
+function swipeCardInner(j){
+  const hasAi = j.llm_score !== null && j.llm_score !== undefined;
+  const score = hasAi ? j.llm_score : j.keyword_score;
+  const reason = j.llm_reasoning ? esc(j.llm_reasoning) : 'Matched on your keywords — not AI-reviewed yet.';
+  return `<div class="swipetop"><span class="swipescore${hasAi?'':' plain'}">${score}</span>
+      <div><div class="swipetitle">${esc(j.title)}</div><div class="swipeco">${esc(j.company)}</div></div></div>
+    <div class="swipetags"><span class="badge ${j.tier}">${j.tier.replace('_',' ')}</span>
+      <span class="pill">${j.work_mode}</span><span class="pill">${j.region}</span>
+      <span class="pill">${j.seniority}</span><span class="pill">${esc(j.location)}</span></div>
+    <div class="swipereason">${reason}</div>
+    <div class="swipelink"><a href="${j.url}" target="_blank" rel="noopener">View full posting →</a></div>`;
+}
+function renderSwipe(){
+  const stack = $('swipeStack'); if(!stack) return;
+  stack.innerHTML = '';
+  if(swipeIdx >= swipeJobs.length){
+    stack.innerHTML = '<div class="swipedone">You’re all caught up — no more jobs to swipe right now.<br>Hit “Scan now” or check back after the next scan.</div>';
+    return;
+  }
+  const next = swipeJobs[swipeIdx+1];
+  if(next){ const b = document.createElement('div'); b.className = 'swipecard behind'; b.innerHTML = swipeCardInner(next); stack.appendChild(b); }
+  const cur = swipeJobs[swipeIdx];
+  const c = document.createElement('div'); c.className = 'swipecard';
+  c.innerHTML = swipeCardInner(cur) + '<div class="swipehint like">SAVE</div><div class="swipehint nope">PASS</div>';
+  stack.appendChild(c);
+  attachSwipeDrag(c);
+}
+function attachSwipeDrag(card){
+  let startX=0, startY=0, dx=0, dragging=false;
+  const like = card.querySelector('.swipehint.like'), nope = card.querySelector('.swipehint.nope');
+  card.addEventListener('pointerdown', e => {
+    if(e.target.closest('a')) return;
+    dragging = true; startX = e.clientX; startY = e.clientY; dx = 0;
+    card.style.transition = 'none';
+    try{ card.setPointerCapture(e.pointerId); }catch(_){}
+  });
+  card.addEventListener('pointermove', e => {
+    if(!dragging) return;
+    e.preventDefault();
+    dx = e.clientX - startX; const dy = e.clientY - startY;
+    card.style.transform = `translate(${dx}px, ${dy*0.25}px) rotate(${dx/22}deg)`;
+    if(like) like.style.opacity = Math.max(0, Math.min(1, dx/60));
+    if(nope) nope.style.opacity = Math.max(0, Math.min(1, -dx/60));
+  });
+  const end = () => {
+    if(!dragging) return; dragging = false;
+    if(Math.abs(dx) > 60){
+      swipeFly(card, dx>0 ? 'right' : 'left');
+      commitSwipe(dx>0 ? 'saved' : 'dismissed');
+    } else {
+      card.style.transition = 'transform .3s ease';
+      card.style.transform = '';
+      if(like) like.style.opacity = 0; if(nope) nope.style.opacity = 0;
+    }
+  };
+  card.addEventListener('pointerup', end);
+  card.addEventListener('pointercancel', end);
+}
+function swipeFly(card, dir){
+  card.style.transition = 'transform .5s cubic-bezier(.25,.6,.3,1), opacity .5s ease';
+  card.style.transform = dir==='right' ? 'translate(150%,-30px) rotate(20deg)' : 'translate(-150%,-30px) rotate(-20deg)';
+  card.style.opacity = '0';
+}
+function commitSwipe(status){
+  const j = swipeJobs[swipeIdx]; if(!j) return;
+  swipeHist.push({ id: j.id, idx: swipeIdx, dir: status==='saved' ? 'right' : 'left' });
+  fetch('/api/jobs/status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:j.id,status})});
+  swipeIdx++;
+  setTimeout(renderSwipe, 300);
+}
+function swipeCommit(status){
+  if(document.activeElement && document.activeElement.blur) document.activeElement.blur();
+  const stack = $('swipeStack'); const card = stack && stack.querySelector('.swipecard:not(.behind)');
+  if(card) swipeFly(card, status==='saved' ? 'right' : 'left');
+  commitSwipe(status);
+}
+async function swipeUndo(){
+  if(document.activeElement && document.activeElement.blur) document.activeElement.blur();
+  const last = swipeHist.pop(); if(!last) return;
+  await fetch('/api/jobs/status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:last.id,status:'active'})});
+  swipeIdx = last.idx;
+  renderSwipe();
+  // Animate the restored card flying back in from the direction it left.
+  const card = $('swipeStack').querySelector('.swipecard:not(.behind)');
+  if(card){
+    const from = last.dir==='right' ? 'translate(150%,-30px) rotate(20deg)' : 'translate(-150%,-30px) rotate(-20deg)';
+    card.style.transition = 'none';
+    card.style.transform = from;
+    card.style.opacity = '0';
+    requestAnimationFrame(()=>requestAnimationFrame(()=>{
+      card.style.transition = 'transform .5s cubic-bezier(.25,.7,.3,1), opacity .4s ease';
+      card.style.transform = '';
+      card.style.opacity = '1';
+    }));
+  }
+}
+
+function bar(label, val, max){
+  const w = Math.max(2, (val/max)*100);
+  return `<div class="barrow"><div class="barlbl">${label}</div><div class="bartrack"><div class="barfill" style="width:${w}%"></div></div><div class="barval">${val}</div></div>`;
+}
+
+async function loadAnalytics(){
+  const d = await (await fetch('/api/analytics')).json();
+  const pipeSum = Object.values(d.pipeline).reduce((a,b)=>a+b,0);
+  const appliedPlus = d.pipeline.applied + d.pipeline.interviewing + d.pipeline.offer + d.pipeline.rejected;
+  const tiles = [['Total jobs', d.total],['Apply-now matches', d.tiers.apply_now],['In pipeline', pipeSum],['Applied', appliedPlus]];
+  const tileHtml = tiles.map(t=>`<div class="tile"><div class="tilenum">${t[1]}</div><div class="tilelbl">${t[0]}</div></div>`).join('');
+
+  const stages = [['saved','Saved'],['applied','Applied'],['interviewing','Interviewing'],['offer','Offer'],['rejected','Rejected']];
+  const pmax = Math.max(1, ...stages.map(s=>d.pipeline[s[0]]));
+  const funnel = stages.map(s=>bar(s[1], d.pipeline[s[0]], pmax)).join('');
+
+  const tiers = [['apply_now','Apply now'],['strong','Strong'],['maybe','Maybe'],['skip','Skip']];
+  const tmax = Math.max(1, ...tiers.map(t=>d.tiers[t[0]]));
+  const tierBars = tiers.map(t=>bar(t[1], d.tiers[t[0]], tmax)).join('');
+
+  const sgmax = Math.max(1, ...d.sources.map(s=>s.good));
+  const srcBars = d.sources.filter(s=>s.total>0).map(s=>{
+    const w = Math.max(2, (s.good/sgmax)*100);
+    return `<div class="barrow"><div class="barlbl">${esc(s.source)}</div><div class="bartrack"><div class="barfill" style="width:${w}%"></div></div><div class="barval">${s.good}<span class="barsub">/${s.total}</span></div></div>`;
+  }).join('');
+
+  $('analytics').innerHTML = `
+    <div class="tiles">${tileHtml}</div>
+    <div class="acards">
+      <div class="panel"><h2>Application funnel</h2>${appliedPlus||d.pipeline.saved ? funnel : '<div class="muted">Save and apply to jobs to see your funnel here.</div>'}</div>
+      <div class="panel"><h2>Matches by tier</h2>${tierBars}</div>
+    </div>
+    <div class="panel"><h2>Best sources <span class="muted">— good matches (apply-now + strong) per source</span></h2>${srcBars || '<div class="muted">Run a scan to see source data.</div>'}</div>`;
+}
+
+async function loadProfile(){
+  try{
+    const d = await (await fetch('/api/profile')).json();
+    renderChips('rolesChips','roles', d.target_roles||[]);
+    renderChips('skillsChips','skills', d.skills||[]);
+    renderChips('interestsChips','interests', d.interests||[]);
+    const e = d.email||{};
+    $('emailEnabled').checked = !!e.enabled;
+    $('emailFrom').value = e.from||'';
+    $('emailTo').value = e.to||'';
+    const note = $('pwNote');
+    if(e.key_set){
+      note.className='msg ok'; note.textContent='Resend API key found in your .env file — you’re ready to receive digests.';
+    } else {
+      note.className='msg err';
+      note.innerHTML='No API key yet. Create a free key at <b>resend.com</b> and add it to your <b>.env</b> file as <code>RESEND_API_KEY=...</code> (this one secret stays out of the app for safety).';
+    }
+  }catch(e){}
+}
+async function saveEmail(){
+  const body = { enabled: $('emailEnabled').checked, from: $('emailFrom').value.trim(), to: $('emailTo').value.trim() };
+  const msg = $('emailMsg');
+  try{
+    const r = await fetch('/api/profile/email',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(r.ok){ msg.textContent='Saved'; setTimeout(()=>msg.textContent='',2500); loadProfile(); }
+    else { const d=await r.json(); msg.textContent = d.error||'Could not save'; }
+  }catch(e){ msg.textContent='Network error'; }
+}
+function renderChips(elId, field, items){
+  $(elId).innerHTML = items.map(v =>
+    `<span class="chip">${esc(v)}<button title="Remove" onclick="delP('${field}','${encodeURIComponent(v)}')">×</button></span>`
+  ).join('') || '<span class="muted">none yet</span>';
+}
+async function uploadResume(){
+  const files = $('resumeFile').files;
+  const msg = $('resumeMsg'); msg.className='msg';
+  if(!files.length) return;
+  const btn = $('resumeBtn'); btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Reading…';
+  const fd = new FormData();
+  for(const f of files) fd.append('file', f);
+  try{
+    const r = await fetch('/api/profile/resume',{method:'POST',body:fd});
+    const d = await r.json();
+    if(r.ok){ msg.className='msg ok'; msg.textContent = d.message || 'Done.'; loadProfile(); }
+    else { msg.className='msg err'; msg.textContent = d.error || 'Could not read that file.'; }
+  }catch(e){ msg.className='msg err'; msg.textContent = 'Upload error.'; }
+  btn.disabled = false; btn.textContent = 'Upload';
+}
+
+async function addP(field, inputId){
+  const el = $(inputId); const value = el.value.trim(); if(!value) return;
+  await fetch('/api/profile/list',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({field,value})});
+  el.value=''; loadProfile();
+}
+async function delP(field, encValue){
+  const value = decodeURIComponent(encValue);
+  await fetch('/api/profile/list',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({field,value,remove:true})});
+  loadProfile();
+}
+
+let currentView = 'home';
+function showView(v){
+  currentView = v;
+  document.querySelectorAll('.view').forEach(el=>el.classList.add('hidden'));
+  const target = document.getElementById('view-'+v); if(target) target.classList.remove('hidden');
+  document.querySelectorAll('.navitem').forEach(el=>el.classList.toggle('active', el.dataset.view===v));
+  if(v==='home') loadJobs();
+  if(v==='swipe') loadSwipe();
+  if(v==='tracker') loadTracker();
+  if(v==='analytics') loadAnalytics();
+  if(v==='profile' || v==='email') loadProfile();
+  if(v==='companies') loadCompanies();
+  window.scrollTo(0,0);
+}
+document.querySelectorAll('.navitem').forEach(el=>el.addEventListener('click',()=>showView(el.dataset.view)));
+showView('home');
+</script>
+</body>
+</html>

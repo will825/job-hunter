@@ -1,0 +1,26 @@
+# systemd unit for the always-on web dashboard (Linux / Raspberry Pi).
+#
+# Install:
+#   sudo cp scheduling/linux/jobhunter.service /etc/systemd/system/
+#   # edit User= and the two paths below to match your setup
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now jobhunter
+#
+# Logs:   journalctl -u jobhunter -f
+# Status: systemctl status jobhunter
+
+[Unit]
+Description=Job Hunter web server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/home/YOUR_USER/JobHunter
+ExecStart=/home/YOUR_USER/JobHunter/target/release/job_hunter serve
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

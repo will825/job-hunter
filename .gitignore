@@ -1,0 +1,27 @@
+# ── Build artifacts ───────────────────────────────────────────
+/target
+
+# ── Private data — NEVER commit these ─────────────────────────
+# API keys (Groq, Adzuna, Resend)
+/.env
+.env
+# Personal profile (name, bio, email, resume-derived data)
+/profile.toml
+profile.toml
+# Local SQLite database of scraped/scored jobs
+*.db
+/jobs.db
+# Any resume files
+*.pdf
+# Cached HTML snapshots
+/jobs_snapshot.html
+jobs_snapshot.html
+
+# ── Logs ──────────────────────────────────────────────────────
+*.log
+/digest.log
+/serve.log
+
+# ── OS / editor cruft ─────────────────────────────────────────
+.DS_Store
+node_modules/

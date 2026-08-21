@@ -1,0 +1,27 @@
+[package]
+name = "job_hunter"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+# Local web server for the company-management UI (multipart for resume upload)
+axum = { version = "0.7", features = ["multipart"] }
+# Extract text from an uploaded resume PDF
+pdf-extract = "0.7"
+# HTTP client. rustls avoids a system OpenSSL dependency (cleaner cross-platform builds).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# (De)serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Local storage. `bundled` compiles SQLite in, so there's no system libsqlite to install.
+rusqlite = { version = "0.32", features = ["bundled"] }
+# Stable dedup hashing
+sha2 = "0.10"
+# Ergonomic error handling
+anyhow = "1"
+# Human-editable profile config
+toml = "0.8"
+# Format-preserving TOML edits (so editing the profile from the UI keeps comments)
+toml_edit = "0.22"
