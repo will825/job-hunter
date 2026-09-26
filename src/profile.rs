@@ -100,7 +100,7 @@ impl Default for Llm {
         Llm {
             enabled: true,
             provider: "groq".to_string(),
-            model: "llama-3.3-70b-versatile".to_string(),
+            model: "openai/gpt-oss-120b".to_string(),
             max_jobs_per_run: 30,
         }
     }
@@ -416,7 +416,9 @@ maybe = 6
 [llm]
 enabled = true
 provider = "groq"                 # groq | none
-model = "llama-3.3-70b-versatile"
+# Groq retires models periodically; if scoring starts 404-ing, update this to a
+# current id from https://console.groq.com/docs/models
+model = "openai/gpt-oss-120b"
 max_jobs_per_run = 30             # cap LLM calls per scan
 
 # Optional "watch any careers page" feature (reads pages that aren't on a known
