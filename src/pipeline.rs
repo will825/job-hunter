@@ -43,6 +43,8 @@ pub struct ScanSummary {
     pub inserted: usize,
     pub already_seen: usize,
     pub merged: usize,
+    /// Jobs that hit a DB error while storing — logged and skipped.
+    pub store_failed: usize,
     pub total_in_db: i64,
     /// (label, error) for each board that failed — the scan continues past them.
     pub failures: Vec<(String, String)>,
@@ -143,6 +145,7 @@ pub fn record_last_run(conn: &Connection, trigger: &str, s: &ScanSummary) -> Res
         "inserted": s.inserted,
         "already_seen": s.already_seen,
         "merged": s.merged,
+        "store_failed": s.store_failed,
         "pruned": s.pruned,
         "total_in_db": s.total_in_db,
         "llm_enabled": s.llm_enabled,
@@ -186,8 +189,12 @@ pub async fn fetch_all(
 }
 
 /// Phase 2 (sync, no network): enrich + store the fetched jobs.
+///
+/// All upserts go in one transaction, so a scan is a single commit rather than
+/// one per job. A DB error on one job is logged and counted, never fatal.
 pub fn store_all(conn: &Connection, model: &ScoringModel, fetched: Vec<BoardFetch>) -> Result<ScanSummary> {
     let mut s = ScanSummary { boards_scanned: fetched.len(), ..Default::default() };
+    let tx = conn.unchecked_transaction()?;
     for board in fetched {
         match board.result {
             Ok(mut jobs) => {
@@ -195,16 +202,21 @@ pub fn store_all(conn: &Connection, model: &ScoringModel, fetched: Vec<BoardFetc
                 s.per_board.push((board.label, jobs.len()));
                 for job in &mut jobs {
                     enrich(job, model);
-                    match db::upsert_job(conn, job)? {
-                        Upsert::Inserted => s.inserted += 1,
-                        Upsert::AlreadySeen => s.already_seen += 1,
-                        Upsert::MergedDuplicate => s.merged += 1,
+                    match db::upsert_job(&tx, job) {
+                        Ok(Upsert::Inserted) => s.inserted += 1,
+                        Ok(Upsert::AlreadySeen) => s.already_seen += 1,
+                        Ok(Upsert::MergedDuplicate) => s.merged += 1,
+                        Err(e) => {
+                            s.store_failed += 1;
+                            eprintln!("couldn't store {} — {}: {e:#}", job.company, job.title);
+                        }
                     }
                 }
             }
             Err(e) => s.failures.push((board.label, e.to_string())),
         }
     }
+    tx.commit()?;
     s.boards_failed = s.failures.len();
     s.total_in_db = db::count_jobs(conn)?;
     Ok(s)

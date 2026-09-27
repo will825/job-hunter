@@ -90,7 +90,7 @@ async fn index() -> Html<&'static str> {
 }
 
 async fn list_companies(State(st): State<AppState>) -> Response {
-    let conn = match db::open(&st.db_path) {
+    let conn = match db::connect(&st.db_path) {
         Ok(c) => c,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
@@ -118,7 +118,7 @@ async fn add_company(State(st): State<AppState>, Json(req): Json<AddReq>) -> Res
         Ok(s) => s,
         Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
     };
-    let conn = match db::open(&st.db_path) {
+    let conn = match db::connect(&st.db_path) {
         Ok(c) => c,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
@@ -139,7 +139,7 @@ async fn add_company(State(st): State<AppState>, Json(req): Json<AddReq>) -> Res
 }
 
 async fn delete_company(State(st): State<AppState>, Path(id): Path<i64>) -> Response {
-    let conn = match db::open(&st.db_path) {
+    let conn = match db::connect(&st.db_path) {
         Ok(c) => c,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
@@ -154,7 +154,7 @@ async fn scan(State(st): State<AppState>) -> Response {
     // Load profile + sources with a short-lived connection, then DROP it before
     // any network await (rusqlite's Connection isn't Send).
     let (model, sources) = {
-        let conn = match db::open(&st.db_path) {
+        let conn = match db::connect(&st.db_path) {
             Ok(c) => c,
             Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         };
@@ -176,7 +176,7 @@ async fn scan(State(st): State<AppState>) -> Response {
     let fetched = pipeline::fetch_all(&st.client, &ats_sources, None, |_| {}).await;
 
     // Sync store with a fresh connection.
-    let conn = match db::open(&st.db_path) {
+    let conn = match db::connect(&st.db_path) {
         Ok(c) => c,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
@@ -213,7 +213,7 @@ async fn scan(State(st): State<AppState>) -> Response {
             if let Ok(cfg) = cfg {
                 summary.set_llm(&cfg, &tally);
             }
-            let saved = db::open(db_path.as_str())
+            let saved = db::connect(db_path.as_str())
                 .and_then(|conn| pipeline::record_last_run(&conn, "web", &summary));
             if let Err(e) = saved {
                 eprintln!("couldn't record last_run: {e:#}");
@@ -252,7 +252,7 @@ async fn rescore_in_background(
     }
     // 1. Read candidates, then drop the connection before any await.
     let candidates = {
-        let conn = db::open(db_path.as_str())?;
+        let conn = db::connect(db_path.as_str())?;
         db::top_for_rescore(&conn, cfg.max_jobs_per_run)?
     };
     if candidates.is_empty() {
@@ -272,7 +272,7 @@ async fn rescore_in_background(
         }
         match llm::score_fit(&cfg, &client, &profile, title, company, description).await {
             Ok(v) => {
-                let conn = db::open(db_path.as_str())?;
+                let conn = db::connect(db_path.as_str())?;
                 db::set_llm_verdict(&conn, id, v.fit_score, &v.reasoning, &v.gaps.join("; "))?;
                 tally.ok();
             }
@@ -286,13 +286,13 @@ async fn rescore_in_background(
     }
     eprintln!("LLM re-scored {} job(s) ({} failed).", tally.scored, tally.failed);
     // 3. Re-derive tiers from the fit scores once at the end.
-    let conn = db::open(db_path.as_str())?;
+    let conn = db::connect(db_path.as_str())?;
     db::rederive_llm_tiers(&conn)?;
     Ok(tally)
 }
 
 async fn jobs(State(st): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Response {
-    let conn = match db::open(&st.db_path) {
+    let conn = match db::connect(&st.db_path) {
         Ok(c) => c,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
@@ -331,7 +331,7 @@ struct StatusReq {
 }
 
 async fn set_job_status(State(st): State<AppState>, Json(req): Json<StatusReq>) -> Response {
-    let conn = match db::open(&st.db_path) {
+    let conn = match db::connect(&st.db_path) {
         Ok(c) => c,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
@@ -353,7 +353,7 @@ struct NoteReq {
 }
 
 async fn set_job_note(State(st): State<AppState>, Json(req): Json<NoteReq>) -> Response {
-    let conn = match db::open(&st.db_path) {
+    let conn = match db::connect(&st.db_path) {
         Ok(c) => c,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
@@ -364,7 +364,7 @@ async fn set_job_note(State(st): State<AppState>, Json(req): Json<NoteReq>) -> R
 }
 
 async fn tracker(State(st): State<AppState>) -> Response {
-    let conn = match db::open(&st.db_path) {
+    let conn = match db::connect(&st.db_path) {
         Ok(c) => c,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
@@ -375,7 +375,7 @@ async fn tracker(State(st): State<AppState>) -> Response {
 }
 
 async fn analytics(State(st): State<AppState>) -> Response {
-    let conn = match db::open(&st.db_path) {
+    let conn = match db::connect(&st.db_path) {
         Ok(c) => c,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };

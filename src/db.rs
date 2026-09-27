@@ -10,18 +10,27 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::models::Job;
 
-/// Open (creating if needed) the SQLite database at `path` and ensure the
-/// schema exists.
-pub fn open(path: &str) -> Result<Connection> {
-    let conn = Connection::open(path)?;
-    // WAL + NORMAL sync: fast, safe enough for a local single-writer app, and
-    // easy on disk I/O. busy_timeout avoids spurious "database is locked".
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+/// One-time setup for the database at `path`: create the schema, apply
+/// additive migrations, and seed the default watchlist. Run once at startup
+/// (idempotent); everything else uses [`connect`].
+pub fn init(path: &str) -> Result<()> {
+    let conn = connect(path)?;
     init_schema(&conn)?;
     migrate(&conn)?;
     seed_defaults(&conn)?;
+    Ok(())
+}
+
+/// Open a connection to an already-initialized database. Cheap and write-free:
+/// just sets per-connection pragmas, so it's safe to call per request.
+pub fn connect(path: &str) -> Result<Connection> {
+    let conn = Connection::open(path)?;
+    // WAL + NORMAL sync: fast, safe enough for a local single-writer app, and
+    // easy on disk I/O. busy_timeout rides out a scan's write lock rather than
+    // failing with "database is locked".
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.busy_timeout(std::time::Duration::from_secs(10))?;
     Ok(conn)
 }
 
@@ -88,10 +97,13 @@ fn migrate(conn: &Connection) -> Result<()> {
     }
     // Backfill last_seen for rows that predate the column: assume they were last
     // seen when first stored. The next scan refreshes it for anything still live.
-    conn.execute(
-        "UPDATE jobs SET last_seen = first_seen WHERE last_seen IS NULL",
-        [],
-    )?;
+    // Only needed the one time the column is added.
+    if !existing.contains("last_seen") {
+        conn.execute(
+            "UPDATE jobs SET last_seen = first_seen WHERE last_seen IS NULL",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -679,6 +691,27 @@ mod tests {
 
     fn job(source: &str, title: &str, url: &str) -> Job {
         Job::new("Splice", title, "Remote", url, source, "desc", None, "{}")
+    }
+
+    #[test]
+    fn init_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!("job_hunter_init_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("jobs.db");
+        let path = path.to_str().unwrap();
+        init(path).unwrap();
+        let conn = connect(path).unwrap();
+        let companies = list_companies(&conn).unwrap().len();
+        assert!(companies > 0, "first init should seed the watchlist");
+        assert_eq!(upsert_job(&conn, &job("greenhouse", "Rust Engineer", "u1")).unwrap(), Upsert::Inserted);
+        drop(conn);
+
+        init(path).unwrap();
+        let conn = connect(path).unwrap();
+        assert_eq!(list_companies(&conn).unwrap().len(), companies, "second init must not re-seed");
+        assert_eq!(count_jobs(&conn).unwrap(), 1, "second init must keep stored jobs");
+        drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

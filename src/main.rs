@@ -39,6 +39,9 @@ const WEB_PORT: u16 = 8787;
 
 const ENV_FILE: &str = ".env";
 
+/// Subcommands `main` dispatches; anything else is rejected before the DB is touched.
+const KNOWN_COMMANDS: &[&str] = &["serve", "add", "list", "remove", "digest"];
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load API keys from the private `.env` file so the user has one obvious
@@ -52,7 +55,18 @@ async fn main() -> Result<()> {
         .build()?;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
+    let command = args.first().map(String::as_str);
+    if let Some(other) = command.filter(|c| !KNOWN_COMMANDS.contains(c)) {
+        return Err(anyhow!(
+            "unknown command '{other}'. Use: (no args) | serve | add <url> | list | remove <id> | digest"
+        ));
+    }
+
+    // Schema, migrations and seeding happen once here; every later connection
+    // (CLI or per web request) is a plain `db::connect`.
+    db::init(DB_PATH)?;
+
+    match command {
         Some("serve") => {
             server::serve(DB_PATH.to_string(), PROFILE_PATH.to_string(), client, WEB_PORT).await
         }
@@ -60,9 +74,7 @@ async fn main() -> Result<()> {
         Some("list") => cmd_list(),
         Some("remove") => cmd_remove(args.get(1)),
         Some("digest") => cmd_digest(&client).await,
-        Some(other) => Err(anyhow!(
-            "unknown command '{other}'. Use: (no args) | serve | add <url> | list | remove <id> | digest"
-        )),
+        Some(other) => unreachable!("unknown command '{other}' rejected above"),
         None => cmd_scan(&client).await,
     }
 }
@@ -89,7 +101,7 @@ fn load_env_file(path: &str) {
 
 /// Default command: scan every watched board and print a summary.
 async fn cmd_scan(client: &reqwest::Client) -> Result<()> {
-    let conn = db::open(DB_PATH)?;
+    let conn = db::connect(DB_PATH)?;
     let profile = profile::load_or_create(PROFILE_PATH)?;
     if !profile.name.is_empty() {
         println!("Profile: {} — {} target role(s)\n", profile.name, profile.target_roles.len());
@@ -106,6 +118,9 @@ async fn cmd_scan(client: &reqwest::Client) -> Result<()> {
     println!("  New this run:     {}", summary.inserted);
     println!("  Already seen:     {}", summary.already_seen);
     println!("  Duplicates merged:{}", summary.merged);
+    if summary.store_failed > 0 {
+        println!("  Failed to store:  {}", summary.store_failed);
+    }
     println!("  Total in DB:      {}", summary.total_in_db);
     if summary.llm_enabled {
         println!("  AI scored/failed: {}/{}", summary.llm_scored, summary.llm_failed);
@@ -140,7 +155,7 @@ async fn cmd_scan(client: &reqwest::Client) -> Result<()> {
 /// `digest`: the daily run — scan, then email only the NEW apply-now/strong
 /// matches since last time (marking them so they're never re-sent).
 async fn cmd_digest(client: &reqwest::Client) -> Result<()> {
-    let conn = db::open(DB_PATH)?;
+    let conn = db::connect(DB_PATH)?;
     let profile = profile::load_or_create(PROFILE_PATH)?;
     let ecfg = email::EmailConfig::from_profile(&profile);
 
@@ -212,7 +227,7 @@ async fn cmd_add(client: &reqwest::Client, url: Option<&String>) -> Result<()> {
     let url = url.ok_or_else(|| anyhow!("usage: job_hunter add <careers-page-or-board-url>"))?;
     println!("Detecting board at {url} …");
     let source = detect::detect(url, client).await?;
-    let conn = db::open(DB_PATH)?;
+    let conn = db::connect(DB_PATH)?;
     let inserted = db::add_company(&conn, source.ats(), source.token(), &source.label())?;
     if inserted {
         println!("✓ Added {}", source.label());
@@ -230,7 +245,7 @@ async fn cmd_add(client: &reqwest::Client, url: Option<&String>) -> Result<()> {
 
 /// `list`: show watched companies.
 fn cmd_list() -> Result<()> {
-    let conn = db::open(DB_PATH)?;
+    let conn = db::connect(DB_PATH)?;
     let companies = db::list_companies(&conn)?;
     println!("Watching {} board(s):\n", companies.len());
     for c in companies {
@@ -245,7 +260,7 @@ fn cmd_remove(id: Option<&String>) -> Result<()> {
         .ok_or_else(|| anyhow!("usage: job_hunter remove <id>  (see `list`)"))?
         .parse()
         .map_err(|_| anyhow!("id must be a number (see `list`)"))?;
-    let conn = db::open(DB_PATH)?;
+    let conn = db::connect(DB_PATH)?;
     if db::remove_company(&conn, id)? {
         println!("✓ Removed company #{id}");
     } else {
