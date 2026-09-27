@@ -18,9 +18,13 @@ Runs 24/7 on a Raspberry Pi (systemd service + 7 AM digest cron); see `schedulin
 5. **Digest** — `job_hunter digest` emails new apply_now/strong matches via Resend, marks
    `notified_at`. First run only baselines (meta key `digest_baselined`).
 
-CLI `scan`/`digest` use `pipeline::full_scan`. The web "Scan now" (`server::scan`) re-implements
-the same steps with short-lived connections, skips custom pages, and spawns the LLM re-rank
-in the background (`rescore_in_background`) so the request returns quickly.
+CLI `scan`/`digest` use `pipeline::full_scan`. The web "Scan now" (`POST /api/scan`) returns 202
+and runs `server::run_web_scan` in a spawned task — the same steps with short-lived connections,
+skipping custom pages — reporting progress in `AppState.scan` (`GET /api/scan/status`, polled by the UI).
+
+Only one scan runs at a time: every scan (CLI scan/digest and web) holds `scan_lock::ScanLock`
+on `./jobhunter.scan.lock`. The web returns 409 if it's held; the CLI waits up to 10 min. A lock
+whose pid is dead is taken over (or, if the pid can't be checked, once it's older than 30 min).
 
 Web UI is **one file**, `src/web/index.html` (inline CSS + vanilla JS), embedded via
 `include_str!` in `server.rs`. Views: Home (triage), Swipe, Tracker, Analytics, Profile,
@@ -30,6 +34,7 @@ Watched companies, Digest email, Settings. It talks to the `/api/*` JSON routes 
 
 - `src/main.rs` — CLI entry, `.env` loader, subcommands: (none)=scan, `serve`, `add <url>`, `list`, `remove <id>`, `digest`.
 - `src/server.rs` — axum router + JSON API handlers; binds `0.0.0.0:8787`, no auth.
+- `src/scan_lock.rs` — cross-process scan lock file (create_new; takeover when holder pid is dead).
 - `src/pipeline.rs` — fetch/store/prune/rescore orchestration, `full_scan`, Adzuna source expansion.
 - `src/db.rs` — SQLite schema (`jobs`, `meta`, `companies`), `migrate`, seeding, upsert/dedup, queries.
 - `src/models.rs` — `Job` struct; stable sha256 id from company+title+url.

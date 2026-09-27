@@ -127,6 +127,12 @@ impl LlmTally {
 /// Save a run's summary as JSON in `meta` under `last_run`, for the web UI.
 /// `trigger` is what started the run: "scan", "digest", or "web".
 pub fn record_last_run(conn: &Connection, trigger: &str, s: &ScanSummary) -> Result<()> {
+    db::meta_set(conn, "last_run", &summary_json(trigger, s).to_string())
+}
+
+/// A run's summary as JSON — the shape stored in `last_run` and returned by
+/// the web scan status.
+pub fn summary_json(trigger: &str, s: &ScanSummary) -> serde_json::Value {
     let at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -136,7 +142,7 @@ pub fn record_last_run(conn: &Connection, trigger: &str, s: &ScanSummary) -> Res
         .iter()
         .map(|(label, error)| serde_json::json!({ "board": label, "error": error }))
         .collect();
-    let v = serde_json::json!({
+    serde_json::json!({
         "at": at,
         "trigger": trigger,
         "boards_scanned": s.boards_scanned,
@@ -153,8 +159,7 @@ pub fn record_last_run(conn: &Connection, trigger: &str, s: &ScanSummary) -> Res
         "llm_failed": s.llm_failed,
         "llm_error": s.llm_error,
         "board_errors": board_errors,
-    });
-    db::meta_set(conn, "last_run", &v.to_string())
+    })
 }
 
 /// Phase 1 (async, no DB): fetch every source, one at a time. Per-board errors

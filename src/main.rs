@@ -24,6 +24,7 @@ mod llm;
 mod models;
 mod pipeline;
 mod profile;
+mod scan_lock;
 mod score;
 mod server;
 mod sources;
@@ -35,6 +36,10 @@ use anyhow::{anyhow, Result};
 
 const DB_PATH: &str = "jobs.db";
 const PROFILE_PATH: &str = "profile.toml";
+/// Held by any running scan (CLI scan/digest or web), so two never overlap.
+const SCAN_LOCK_PATH: &str = "jobhunter.scan.lock";
+/// How long the CLI waits for another scan to finish before giving up.
+const SCAN_LOCK_WAIT: Duration = Duration::from_secs(10 * 60);
 const WEB_PORT: u16 = 8787;
 
 const ENV_FILE: &str = ".env";
@@ -68,7 +73,14 @@ async fn main() -> Result<()> {
 
     match command {
         Some("serve") => {
-            server::serve(DB_PATH.to_string(), PROFILE_PATH.to_string(), client, WEB_PORT).await
+            server::serve(
+                DB_PATH.to_string(),
+                PROFILE_PATH.to_string(),
+                SCAN_LOCK_PATH.to_string(),
+                client,
+                WEB_PORT,
+            )
+            .await
         }
         Some("add") => cmd_add(&client, args.get(1)).await,
         Some("list") => cmd_list(),
@@ -101,6 +113,7 @@ fn load_env_file(path: &str) {
 
 /// Default command: scan every watched board and print a summary.
 async fn cmd_scan(client: &reqwest::Client) -> Result<()> {
+    let _lock = scan_lock::ScanLock::acquire_waiting(SCAN_LOCK_PATH, SCAN_LOCK_WAIT).await?;
     let conn = db::connect(DB_PATH)?;
     let profile = profile::load_or_create(PROFILE_PATH)?;
     if !profile.name.is_empty() {
@@ -155,6 +168,7 @@ async fn cmd_scan(client: &reqwest::Client) -> Result<()> {
 /// `digest`: the daily run — scan, then email only the NEW apply-now/strong
 /// matches since last time (marking them so they're never re-sent).
 async fn cmd_digest(client: &reqwest::Client) -> Result<()> {
+    let _lock = scan_lock::ScanLock::acquire_waiting(SCAN_LOCK_PATH, SCAN_LOCK_WAIT).await?;
     let conn = db::connect(DB_PATH)?;
     let profile = profile::load_or_create(PROFILE_PATH)?;
     let ecfg = email::EmailConfig::from_profile(&profile);

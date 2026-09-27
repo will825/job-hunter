@@ -369,23 +369,71 @@ async function del(id){
   loadCompanies();
 }
 
+// Scanning runs server-side in the background: POST starts it, then we poll
+// /api/scan/status until it finishes and reload whatever view is open.
+let scanPoll = null;
 async function scan(){
-  const btn = $('scanBtn'), msg = $('scanMsg');
-  btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Scanning…';
-  msg.textContent = 'Fetching every board — this can take ~40s.';
+  const msg = $('scanMsg');
+  setScanBusy(true, 'Starting scan…');
   try{
     const r = await fetch('/api/scan', {method:'POST'});
-    const d = await r.json();
-    if(r.ok){
-      const removed = d.removed ? `, ${d.removed} expired removed` : '';
-      msg.textContent = `Done — ${d.inserted} new${removed}, ${d.total_in_db} total. AI is scoring the top matches in the background…`;
-      loadJobs();
-      // AI scores/tiers fill in over the next minute; refresh once to show them.
-      setTimeout(loadJobs, 45000);
-    }
-    else { msg.textContent = d.error || 'Scan failed.'; }
+    if(r.status === 202){ watchScan(); return; }
+    const d = await r.json().catch(()=>({}));
+    if(r.status === 409){
+      // Either our own web scan (follow it) or a CLI scan/digest (just say so).
+      const s = await (await fetch('/api/scan/status')).json().catch(()=>({}));
+      if(s.running){ watchScan(); return; }
+      msg.textContent = (d.error || 'A scan is already running') + ' (the daily digest or a terminal scan). Try again in a few minutes.';
+    } else msg.textContent = d.error || 'Scan failed.';
   }catch(e){ msg.textContent = 'Scan error.'; }
-  btn.disabled = false; btn.textContent = 'Scan now';
+  setScanBusy(false);
+}
+
+function setScanBusy(busy, text){
+  const btn = $('scanBtn');
+  btn.disabled = busy;
+  if(busy){ btn.innerHTML = '<span class="spin"></span> Scanning…'; if(text) $('scanMsg').textContent = text; }
+  else btn.textContent = 'Scan now';
+}
+
+function watchScan(){
+  if(scanPoll) return;
+  pollScan();
+  scanPoll = setInterval(pollScan, 2000);
+}
+
+async function pollScan(){
+  let s;
+  try{ s = await (await fetch('/api/scan/status')).json(); }catch(e){ return; } // transient; try again next tick
+  const msg = $('scanMsg');
+  if(s.running){
+    setScanBusy(true);
+    if(s.phase === 'fetching') msg.textContent = s.boards_total ? `Fetching ${s.boards_done}/${s.boards_total} boards…` : 'Fetching boards…';
+    else if(s.phase === 'storing') msg.textContent = 'Saving jobs…';
+    else if(s.phase === 'ai scoring') msg.textContent = 'AI scoring the top matches…';
+    return;
+  }
+  clearInterval(scanPoll); scanPoll = null;
+  setScanBusy(false);
+  if(s.phase === 'failed'){ msg.textContent = 'Scan failed: ' + (s.error || 'unknown error'); return; }
+  const d = s.last_summary;
+  if(d){
+    const removed = d.pruned ? `, ${d.pruned} expired removed` : '';
+    const failed = d.boards_failed ? `, ${d.boards_failed} board(s) failed` : '';
+    const ai = d.llm_error ? ` AI: ${d.llm_error}` : (d.llm_scored ? ` AI scored ${d.llm_scored}.` : '');
+    msg.textContent = `Done — ${d.inserted} new${removed}, ${d.total_in_db} total${failed}.${ai}`;
+  } else msg.textContent = 'Done.';
+  reloadCurrentView();
+}
+
+// Refresh the open view's data in place (no scroll-to-top, unlike showView).
+function reloadCurrentView(){
+  const v = currentView;
+  if(v==='home') loadJobs();
+  if(v==='swipe') loadSwipe();
+  if(v==='tracker') loadTracker();
+  if(v==='analytics') loadAnalytics();
+  if(v==='companies') loadCompanies();
 }
 
 function cardHtml(j, ctx){
@@ -763,6 +811,8 @@ function showView(v){
 }
 document.querySelectorAll('.navitem').forEach(el=>el.addEventListener('click',()=>showView(el.dataset.view)));
 showView('home');
+// A scan may already be running (started before a refresh, or in another tab).
+fetch('/api/scan/status').then(r=>r.json()).then(s=>{ if(s.running) watchScan(); }).catch(()=>{});
 </script>
 </body>
 </html>

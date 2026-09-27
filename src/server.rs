@@ -5,14 +5,15 @@
 //!   GET    /api/companies         list watched sources
 //!   POST   /api/companies {url}   detect + validate + add a source by link
 //!   DELETE /api/companies/:id     remove a source
-//!   POST   /api/scan              run a full scan now
+//!   POST   /api/scan              start a full scan in the background (202; 409 if one is running)
+//!   GET    /api/scan/status       progress of the current/last web scan
 //!   GET    /api/jobs?...          ranked jobs with filters
 //!
 //! Each handler opens its own SQLite connection (cheap with WAL) so we never
 //! share a non-Sync `Connection` across async tasks.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::{
     extract::{Multipart, Path, Query, State},
@@ -21,29 +22,57 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::scan_lock::ScanLock;
 use crate::{db, detect, llm, pipeline, profile};
 
 #[derive(Clone)]
 struct AppState {
     db_path: Arc<String>,
     profile_path: Arc<String>,
+    lock_path: Arc<String>,
     client: reqwest::Client,
+    scan: Arc<Mutex<ScanStatus>>,
+}
+
+/// Progress of the current (or most recent) web scan, polled by the UI.
+#[derive(Debug, Default, Clone, Serialize)]
+struct ScanStatus {
+    running: bool,
+    /// Unix seconds.
+    started_at: Option<u64>,
+    /// "fetching" | "storing" | "ai scoring" | "done" | "failed"
+    phase: Option<&'static str>,
+    boards_done: usize,
+    boards_total: usize,
+    last_summary: Option<serde_json::Value>,
+    error: Option<String>,
+}
+
+impl AppState {
+    /// Mutate the scan status. The std mutex is only ever held for this
+    /// synchronous closure, never across an await.
+    fn update_scan(&self, f: impl FnOnce(&mut ScanStatus)) {
+        f(&mut self.scan.lock().unwrap_or_else(|e| e.into_inner()));
+    }
 }
 
 /// Start the web UI and block serving it.
 pub async fn serve(
     db_path: String,
     profile_path: String,
+    lock_path: String,
     client: reqwest::Client,
     port: u16,
 ) -> anyhow::Result<()> {
     let state = AppState {
         db_path: Arc::new(db_path),
         profile_path: Arc::new(profile_path),
+        lock_path: Arc::new(lock_path),
         client,
+        scan: Arc::new(Mutex::new(ScanStatus::default())),
     };
 
     let app = Router::new()
@@ -51,6 +80,7 @@ pub async fn serve(
         .route("/api/companies", get(list_companies).post(add_company))
         .route("/api/companies/:id", axum::routing::delete(delete_company))
         .route("/api/scan", post(scan))
+        .route("/api/scan/status", get(scan_status))
         .route("/api/jobs", get(jobs))
         .route("/api/jobs/status", post(set_job_status))
         .route("/api/jobs/note", post(set_job_note))
@@ -72,8 +102,9 @@ pub async fn serve(
     println!("    on this Mac:      {url}");
     println!("    on your network:  http://<this-mac-ip>:{port}");
     println!("  (press Ctrl-C to stop)\n");
-    // Only pop a browser when launched interactively — not as a background service.
-    if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+    // Only pop a browser when launched interactively on the Mac — not as a
+    // background service, and not on the Pi (no `open` command there).
+    if cfg!(target_os = "macos") && std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         let _ = std::process::Command::new("open").arg(&url).spawn();
     }
 
@@ -150,91 +181,124 @@ async fn delete_company(State(st): State<AppState>, Path(id): Path<i64>) -> Resp
     }
 }
 
+/// `POST /api/scan`: start a full scan in the background and return 202 right
+/// away. The UI polls `/api/scan/status` for progress. 409 if a scan (web or
+/// CLI) is already running.
 async fn scan(State(st): State<AppState>) -> Response {
-    // Load profile + sources with a short-lived connection, then DROP it before
-    // any network await (rusqlite's Connection isn't Send).
-    let (model, sources) = {
-        let conn = match db::connect(&st.db_path) {
-            Ok(c) => c,
-            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-        };
-        let profile = match profile::load_or_create(&st.profile_path) {
-            Ok(p) => p,
-            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-        };
-        let mut sources = match pipeline::load_sources(&conn) {
-            Ok(s) => s,
-            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-        };
-        sources.extend(pipeline::adzuna_sources(&profile));
-        (profile.compile(), sources)
-    };
-
-    // Async fetch (no DB connection held here). Custom pages are left out of the
-    // web "scan now" for responsiveness; the CLI scan handles those + LLM.
-    let ats_sources: Vec<_> = sources.into_iter().filter(|s| !s.is_custom()).collect();
-    let fetched = pipeline::fetch_all(&st.client, &ats_sources, None, |_| {}).await;
-
-    // Sync store with a fresh connection.
-    let conn = match db::connect(&st.db_path) {
-        Ok(c) => c,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    };
-    let mut s = match pipeline::store_all(&conn, &model, fetched) {
-        Ok(s) => s,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    };
-    // Prune expired postings (untriaged only). Runs after store_all, so every
-    // job that showed up in this scan just had its last_seen refreshed and is
-    // safe from pruning — only genuinely gone postings are removed.
-    let removed = db::prune_stale(&conn, pipeline::STALE_DAYS).unwrap_or(0);
-    s.pruned = removed;
-    drop(conn);
-
-    // Kick off LLM fit-scoring in the background so the button returns promptly
-    // (fetch+store+prune only take ~40s; scoring 100 jobs would take minutes).
-    // The AI scores/tiers fill in over the next minute and appear on reload.
-    // `last_run` is written once scoring finishes, so it holds the LLM counts.
+    const BUSY: &str = "A scan is already running";
+    // Claim the in-process slot first (cheap, and closes the double-click race),
+    // then the cross-process lock shared with the CLI scan/digest.
     {
-        let db_path = st.db_path.clone();
-        let profile_path = st.profile_path.clone();
-        let client = st.client.clone();
-        let mut summary = s.clone();
+        let mut status = st.scan.lock().unwrap_or_else(|e| e.into_inner());
+        if status.running {
+            return err(StatusCode::CONFLICT, BUSY);
+        }
+        let lock = match ScanLock::try_acquire(st.lock_path.as_str()) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => return err(StatusCode::CONFLICT, BUSY),
+            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        *status = ScanStatus {
+            running: true,
+            started_at: Some(unix_now()),
+            phase: Some("fetching"),
+            last_summary: status.last_summary.take(),
+            ..Default::default()
+        };
+        drop(status);
+
+        let st = st.clone();
         tokio::spawn(async move {
-            let cfg = profile::load_or_create(profile_path.as_str())
-                .map(|p| llm::LlmConfig::from_profile(&p));
-            let tally = match rescore_in_background(db_path.clone(), profile_path, client).await {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("background rescore failed: {e:#}");
-                    pipeline::LlmTally { first_error: Some(format!("{e:#}")), ..Default::default() }
-                }
+            // Run the scan in its own task so a panic is caught here and still
+            // reported as "failed" instead of leaving `running` stuck on.
+            let outcome = tokio::spawn(run_web_scan(st.clone())).await;
+            let (summary, error) = match outcome {
+                Ok(Ok(summary)) => (Some(summary), None),
+                Ok(Err(e)) => (None, Some(format!("{e:#}"))),
+                Err(e) => (None, Some(format!("scan task crashed: {e}"))),
             };
-            if let Ok(cfg) = cfg {
-                summary.set_llm(&cfg, &tally);
+            if let Some(e) = &error {
+                eprintln!("web scan failed: {e}");
             }
-            let saved = db::connect(db_path.as_str())
-                .and_then(|conn| pipeline::record_last_run(&conn, "web", &summary));
-            if let Err(e) = saved {
-                eprintln!("couldn't record last_run: {e:#}");
-            }
+            st.update_scan(|s| {
+                s.running = false;
+                s.phase = Some(if error.is_some() { "failed" } else { "done" });
+                if summary.is_some() {
+                    s.last_summary = summary;
+                }
+                s.error = error;
+            });
+            drop(lock);
         });
     }
 
-    Json(json!({
-        "ok": true,
-        "boards_scanned": s.boards_scanned,
-        "boards_failed": s.failures.len(),
-        "total_fetched": s.total_fetched,
-        "inserted": s.inserted,
-        "merged": s.merged,
-        "removed": removed,
-        "total_in_db": s.total_in_db,
-    }))
-    .into_response()
+    (StatusCode::ACCEPTED, Json(json!({ "ok": true }))).into_response()
 }
 
-/// Background LLM re-scoring for the web "Scan now". Opens its own short-lived
+/// `GET /api/scan/status`: the current/last web scan's progress.
+async fn scan_status(State(st): State<AppState>) -> Response {
+    let status = st.scan.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    Json(status).into_response()
+}
+
+/// The web scan itself: fetch → store + prune → LLM re-score, updating
+/// `st.scan` as it goes. Custom pages are left out (the CLI scan handles
+/// those). Connections are short-lived and never held across an await.
+async fn run_web_scan(st: AppState) -> anyhow::Result<serde_json::Value> {
+    // 1. Load profile + sources, then drop the connection before any await.
+    let (model, sources) = {
+        let conn = db::connect(&st.db_path)?;
+        let profile = profile::load_or_create(&st.profile_path)?;
+        let mut sources = pipeline::load_sources(&conn)?;
+        sources.extend(pipeline::adzuna_sources(&profile));
+        (profile.compile(), sources)
+    };
+    let sources: Vec<_> = sources.into_iter().filter(|s| !s.is_custom()).collect();
+    st.update_scan(|s| s.boards_total = sources.len());
+
+    // 2. Fetch (network only).
+    let fetched = pipeline::fetch_all(&st.client, &sources, None, |_| {
+        st.update_scan(|s| s.boards_done += 1);
+    })
+    .await;
+
+    // 3. Store + prune with a fresh connection. Prune runs after store_all, so
+    //    every job seen this scan just had its last_seen refreshed.
+    st.update_scan(|s| s.phase = Some("storing"));
+    let mut summary = {
+        let conn = db::connect(&st.db_path)?;
+        let mut summary = pipeline::store_all(&conn, &model, fetched)?;
+        summary.pruned = db::prune_stale(&conn, pipeline::STALE_DAYS)?;
+        summary
+    };
+
+    // 4. LLM fit-scoring (skips cleanly when unconfigured).
+    st.update_scan(|s| s.phase = Some("ai scoring"));
+    let cfg = profile::load_or_create(&st.profile_path).map(|p| llm::LlmConfig::from_profile(&p))?;
+    let tally = match rescore_in_background(st.db_path.clone(), st.profile_path.clone(), st.client.clone()).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("background rescore failed: {e:#}");
+            pipeline::LlmTally { first_error: Some(format!("{e:#}")), ..Default::default() }
+        }
+    };
+    summary.set_llm(&cfg, &tally);
+
+    let conn = db::connect(&st.db_path)?;
+    if let Err(e) = pipeline::record_last_run(&conn, "web", &summary) {
+        eprintln!("couldn't record last_run: {e:#}");
+    }
+    Ok(pipeline::summary_json("web", &summary))
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// LLM re-scoring step of the web "Scan now". Opens its own short-lived
 /// connections and never holds one across an await, so the future is `Send` and
 /// can be spawned. Scores the top keyword survivors, writes verdicts, and
 /// re-derives tiers from the fit scores (mirrors `pipeline::rescore_llm`,
