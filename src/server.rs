@@ -180,19 +180,80 @@ async fn scan(State(st): State<AppState>) -> Response {
         Ok(c) => c,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
-    match pipeline::store_all(&conn, &model, fetched) {
-        Ok(s) => Json(json!({
-            "ok": true,
-            "boards_scanned": s.boards_scanned,
-            "boards_failed": s.failures.len(),
-            "total_fetched": s.total_fetched,
-            "inserted": s.inserted,
-            "merged": s.merged,
-            "total_in_db": s.total_in_db,
-        }))
-        .into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    let s = match pipeline::store_all(&conn, &model, fetched) {
+        Ok(s) => s,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    // Prune expired postings (untriaged only). Runs after store_all, so every
+    // job that showed up in this scan just had its last_seen refreshed and is
+    // safe from pruning — only genuinely gone postings are removed.
+    let removed = db::prune_stale(&conn, pipeline::STALE_DAYS).unwrap_or(0);
+    drop(conn);
+
+    // Kick off LLM fit-scoring in the background so the button returns promptly
+    // (fetch+store+prune only take ~40s; scoring 100 jobs would take minutes).
+    // The AI scores/tiers fill in over the next minute and appear on reload.
+    {
+        let db_path = st.db_path.clone();
+        let profile_path = st.profile_path.clone();
+        let client = st.client.clone();
+        tokio::spawn(async move {
+            if let Err(e) = rescore_in_background(db_path, profile_path, client).await {
+                eprintln!("background rescore failed: {e:#}");
+            }
+        });
     }
+
+    Json(json!({
+        "ok": true,
+        "boards_scanned": s.boards_scanned,
+        "boards_failed": s.failures.len(),
+        "total_fetched": s.total_fetched,
+        "inserted": s.inserted,
+        "merged": s.merged,
+        "removed": removed,
+        "total_in_db": s.total_in_db,
+    }))
+    .into_response()
+}
+
+/// Background LLM re-scoring for the web "Scan now". Opens its own short-lived
+/// connections and never holds one across an await, so the future is `Send` and
+/// can be spawned. Scores the top keyword survivors, writes verdicts, and
+/// re-derives tiers from the fit scores (mirrors `pipeline::rescore_llm`).
+async fn rescore_in_background(
+    db_path: Arc<String>,
+    profile_path: Arc<String>,
+    client: reqwest::Client,
+) -> anyhow::Result<usize> {
+    let profile = profile::load_or_create(profile_path.as_str())?;
+    let cfg = llm::LlmConfig::from_profile(&profile);
+    if !cfg.is_ready() {
+        return Ok(0);
+    }
+    // 1. Read candidates, then drop the connection before any await.
+    let candidates = {
+        let conn = db::open(db_path.as_str())?;
+        db::top_for_rescore(&conn, cfg.max_jobs_per_run)?
+    };
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    // 2. Score with no DB connection held across an await.
+    let mut verdicts: Vec<(String, i64, String, String)> = Vec::new();
+    for (id, company, title, description) in &candidates {
+        if let Ok(v) = llm::score_fit(&cfg, &client, &profile, title, company, description).await {
+            verdicts.push((id.clone(), v.fit_score, v.reasoning, v.gaps.join("; ")));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    }
+    // 3. Write verdicts + re-derive tiers with a fresh connection.
+    let conn = db::open(db_path.as_str())?;
+    for (id, score, reasoning, gaps) in &verdicts {
+        db::set_llm_verdict(&conn, id, *score, reasoning, gaps)?;
+    }
+    db::rederive_llm_tiers(&conn)?;
+    Ok(verdicts.len())
 }
 
 async fn jobs(State(st): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Response {

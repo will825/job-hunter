@@ -67,6 +67,7 @@ fn migrate(conn: &Connection) -> Result<()> {
         .collect::<rusqlite::Result<_>>()?;
 
     let wanted: &[(&str, &str)] = &[
+        ("last_seen", "TEXT"),
         ("work_mode", "TEXT NOT NULL DEFAULT 'unknown'"),
         ("region", "TEXT NOT NULL DEFAULT 'unknown'"),
         ("seniority", "TEXT NOT NULL DEFAULT 'unknown'"),
@@ -85,6 +86,12 @@ fn migrate(conn: &Connection) -> Result<()> {
             conn.execute(&format!("ALTER TABLE jobs ADD COLUMN {col} {decl}"), [])?;
         }
     }
+    // Backfill last_seen for rows that predate the column: assume they were last
+    // seen when first stored. The next scan refreshes it for anything still live.
+    conn.execute(
+        "UPDATE jobs SET last_seen = first_seen WHERE last_seen IS NULL",
+        [],
+    )?;
     Ok(())
 }
 
@@ -101,6 +108,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
             description  TEXT NOT NULL,
             posted_date  TEXT,
             first_seen   TEXT NOT NULL DEFAULT (datetime('now')),
+            last_seen    TEXT NOT NULL DEFAULT (datetime('now')),
             raw_json     TEXT NOT NULL,
             dedup_key    TEXT NOT NULL,
             work_mode    TEXT NOT NULL DEFAULT 'unknown',
@@ -229,7 +237,8 @@ pub fn upsert_job(conn: &Connection, job: &Job) -> Result<Upsert> {
                 location = ?2, url = ?3, description = ?4,
                 posted_date = ?5, raw_json = ?6,
                 work_mode = ?7, region = ?8, seniority = ?9,
-                keyword_score = ?10, tier = ?11
+                keyword_score = ?10, tier = ?11,
+                last_seen = datetime('now')
             WHERE id = ?1
             "#,
             rusqlite::params![
@@ -257,9 +266,9 @@ pub fn upsert_job(conn: &Connection, job: &Job) -> Result<Upsert> {
                 INSERT INTO jobs
                     (id, company, title, location, url, source, description,
                      posted_date, raw_json, dedup_key,
-                     work_mode, region, seniority, keyword_score, tier)
+                     work_mode, region, seniority, keyword_score, tier, last_seen)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                        ?11, ?12, ?13, ?14, ?15)
+                        ?11, ?12, ?13, ?14, ?15, datetime('now'))
                 "#,
                 rusqlite::params![
                     job.id, job.company, job.title, job.location, job.url,
@@ -291,6 +300,12 @@ pub fn upsert_job(conn: &Connection, job: &Job) -> Result<Upsert> {
                     ],
                 )?;
             }
+            // Whether or not we replaced it, this posting appeared in this scan,
+            // so it's still live — refresh last_seen (keeps it from being pruned).
+            conn.execute(
+                "UPDATE jobs SET last_seen = datetime('now') WHERE dedup_key = ?1",
+                [&job.dedup_key],
+            )?;
             // Either way, the caller sees this as a collapsed duplicate.
             Ok(Upsert::MergedDuplicate)
         }
@@ -300,6 +315,23 @@ pub fn upsert_job(conn: &Connection, job: &Job) -> Result<Upsert> {
 /// Total number of jobs currently stored (used for the run summary).
 pub fn count_jobs(conn: &Connection) -> Result<i64> {
     let n = conn.query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))?;
+    Ok(n)
+}
+
+/// Delete stale/expired postings: jobs the scan hasn't seen in `max_age_days`
+/// (their board stopped listing them — filled or closed). Only untriaged jobs
+/// are removed; anything you've saved/applied/dismissed (`status` set) is kept,
+/// so your tracker never loses a job even after the posting comes down.
+/// Returns how many rows were pruned.
+pub fn prune_stale(conn: &Connection, max_age_days: i64) -> Result<usize> {
+    let cutoff = format!("-{} days", max_age_days.max(1));
+    let n = conn.execute(
+        "DELETE FROM jobs
+         WHERE status IS NULL
+           AND last_seen IS NOT NULL
+           AND last_seen < datetime('now', ?1)",
+        [cutoff],
+    )?;
     Ok(n)
 }
 

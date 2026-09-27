@@ -155,6 +155,9 @@ pub fn enrich(job: &mut Job, model: &ScoringModel) {
     job.tier = score::tier_for(job.keyword_score, &model.tiers).as_str().to_string();
 }
 
+/// How long a posting can go unseen by scans before it's pruned as expired.
+pub const STALE_DAYS: i64 = 14;
+
 /// Run a complete scan: load sources (+ Adzuna + custom pages if enabled),
 /// fetch, store, and LLM-rerank. One code path shared by `cargo run` and the
 /// daily `digest`. Holds the DB connection across awaits (fine for the CLI).
@@ -177,6 +180,13 @@ pub async fn full_scan(
 
     let fetched = fetch_all(client, &sources, ctx.as_ref(), &mut progress).await;
     let summary = store_all(conn, &model, fetched)?;
+
+    // Drop postings the boards no longer list (expired/filled). Runs after
+    // store_all so anything still live has just had its last_seen refreshed.
+    let removed = db::prune_stale(conn, STALE_DAYS)?;
+    if removed > 0 {
+        progress(&format!("Pruned {removed} stale posting(s) not seen in {STALE_DAYS} days."));
+    }
 
     if cfg.is_ready() {
         progress(&format!("LLM fit-scoring top matches ({})…", cfg.model));

@@ -372,11 +372,17 @@ async function del(id){
 async function scan(){
   const btn = $('scanBtn'), msg = $('scanMsg');
   btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Scanning…';
-  msg.textContent = 'Fetching every board — this can take ~20s.';
+  msg.textContent = 'Fetching every board — this can take ~40s.';
   try{
     const r = await fetch('/api/scan', {method:'POST'});
     const d = await r.json();
-    if(r.ok){ msg.textContent = `Done — ${d.total_fetched} fetched, ${d.inserted} new, ${d.total_in_db} total (${d.boards_failed} board(s) failed).`; loadJobs(); }
+    if(r.ok){
+      const removed = d.removed ? `, ${d.removed} expired removed` : '';
+      msg.textContent = `Done — ${d.inserted} new${removed}, ${d.total_in_db} total. AI is scoring the top matches in the background…`;
+      loadJobs();
+      // AI scores/tiers fill in over the next minute; refresh once to show them.
+      setTimeout(loadJobs, 45000);
+    }
     else { msg.textContent = d.error || 'Scan failed.'; }
   }catch(e){ msg.textContent = 'Scan error.'; }
   btn.disabled = false; btn.textContent = 'Scan now';
