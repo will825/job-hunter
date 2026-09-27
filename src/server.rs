@@ -239,21 +239,22 @@ async fn rescore_in_background(
     if candidates.is_empty() {
         return Ok(0);
     }
-    // 2. Score with no DB connection held across an await.
-    let mut verdicts: Vec<(String, i64, String, String)> = Vec::new();
+    // 2. Score and persist each verdict as we go. A short-lived connection per
+    //    write means no connection is held across an await (keeps the future
+    //    Send) and partial progress survives if the task is interrupted.
+    let mut written = 0usize;
     for (id, company, title, description) in &candidates {
         if let Ok(v) = llm::score_fit(&cfg, &client, &profile, title, company, description).await {
-            verdicts.push((id.clone(), v.fit_score, v.reasoning, v.gaps.join("; ")));
+            let conn = db::open(db_path.as_str())?;
+            db::set_llm_verdict(&conn, id, v.fit_score, &v.reasoning, &v.gaps.join("; "))?;
+            written += 1;
         }
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
     }
-    // 3. Write verdicts + re-derive tiers with a fresh connection.
+    // 3. Re-derive tiers from the fit scores once at the end.
     let conn = db::open(db_path.as_str())?;
-    for (id, score, reasoning, gaps) in &verdicts {
-        db::set_llm_verdict(&conn, id, *score, reasoning, gaps)?;
-    }
     db::rederive_llm_tiers(&conn)?;
-    Ok(verdicts.len())
+    Ok(written)
 }
 
 async fn jobs(State(st): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Response {

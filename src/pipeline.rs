@@ -124,24 +124,24 @@ pub async fn rescore_llm(
         return Ok(0);
     }
 
-    let mut verdicts: Vec<(String, i64, String, String)> = Vec::new();
+    let mut written = 0usize;
     for (id, company, title, description) in &candidates {
         match llm::score_fit(cfg, client, profile, title, company, description).await {
             Ok(v) => {
-                let gaps = v.gaps.join("; ");
-                verdicts.push((id.clone(), v.fit_score, v.reasoning, gaps));
+                // Persist each verdict as it's computed, so an interrupted run
+                // (timeout, reboot, rate-limit abort) keeps the work already done
+                // instead of discarding the whole batch.
+                db::set_llm_verdict(conn, id, v.fit_score, &v.reasoning, &v.gaps.join("; "))?;
+                written += 1;
             }
             Err(e) => progress(&format!("  (llm skipped {title}: {e})")),
         }
         tokio::time::sleep(Duration::from_millis(120)).await; // gentle on the API
     }
 
-    for (id, score, reasoning, gaps) in &verdicts {
-        db::set_llm_verdict(conn, id, *score, reasoning, gaps)?;
-    }
     // Tiers are derived from the fit scores, not the LLM's tier label.
     db::rederive_llm_tiers(conn)?;
-    Ok(verdicts.len())
+    Ok(written)
 }
 
 /// Classify and keyword-score a job in place, before it's stored.
