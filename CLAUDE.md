@@ -1,0 +1,95 @@
+# CLAUDE.md — Job Hunter
+
+Self-hosted job search engine in Rust (tokio + axum + rusqlite `bundled` + reqwest `rustls`).
+Single binary: embedded SQLite, embedded web UI, no build step for the frontend.
+Runs 24/7 on a Raspberry Pi (systemd service + 7 AM digest cron); see `scheduling/`.
+
+## Pipeline
+
+1. **Fetch** (async, no DB) — `pipeline::fetch_all` pulls every watched source, one at a
+   time with a 250 ms pause. Per-board errors are captured, never fatal.
+2. **Store** (sync, no network) — `pipeline::store_all` runs `enrich` on each job
+   (classify work_mode/region/seniority → Stage-1 keyword score → tier), then
+   `db::upsert_job` (dedup by stable `id`, then fuzzy `dedup_key`; direct ATS beats aggregators).
+3. **Prune** — `db::prune_stale` deletes untriaged jobs (`status IS NULL`) not seen in
+   `STALE_DAYS` (14). Must run *after* store so live jobs have a fresh `last_seen`.
+4. **LLM re-rank** — Groq scores the top keyword survivors (`llm_score`, reasoning, gaps);
+   `db::rederive_llm_tiers` sets tiers from fit scores. Skipped cleanly with no `GROQ_API_KEY`.
+5. **Digest** — `job_hunter digest` emails new apply_now/strong matches via Resend, marks
+   `notified_at`. First run only baselines (meta key `digest_baselined`).
+
+CLI `scan`/`digest` use `pipeline::full_scan`. The web "Scan now" (`server::scan`) re-implements
+the same steps with short-lived connections, skips custom pages, and spawns the LLM re-rank
+in the background (`rescore_in_background`) so the request returns quickly.
+
+Web UI is **one file**, `src/web/index.html` (inline CSS + vanilla JS), embedded via
+`include_str!` in `server.rs`. Views: Home (triage), Swipe, Tracker, Analytics, Profile,
+Watched companies, Digest email, Settings. It talks to the `/api/*` JSON routes in `server.rs`.
+
+## Module map
+
+- `src/main.rs` — CLI entry, `.env` loader, subcommands: (none)=scan, `serve`, `add <url>`, `list`, `remove <id>`, `digest`.
+- `src/server.rs` — axum router + JSON API handlers; binds `0.0.0.0:8787`, no auth.
+- `src/pipeline.rs` — fetch/store/prune/rescore orchestration, `full_scan`, Adzuna source expansion.
+- `src/db.rs` — SQLite schema (`jobs`, `meta`, `companies`), `migrate`, seeding, upsert/dedup, queries.
+- `src/models.rs` — `Job` struct; stable sha256 id from company+title+url.
+- `src/sources.rs` — `Source` enum (one variant per platform) + default seed watchlist.
+- `src/classify.rs` — heuristic work_mode / region / seniority; returns `unknown` rather than guess.
+- `src/score.rs` — Stage-1 transparent keyword score + `Tier` thresholds.
+- `src/profile.rs` — `profile.toml` load/create, `compile()` to `ScoringModel`, comment-preserving edits (toml_edit).
+- `src/llm.rs` — Groq client: `score_fit` (re-rank) and `extract_jobs` (custom pages). Isolated/removable.
+- `src/custom_page.rs` — optional LLM reader for arbitrary careers pages (`[custom_pages] enabled`).
+- `src/detect.rs` — pasted careers URL → validated `Source` (sniffs embedded ATS boards).
+- `src/email.rs` — Resend digest compose + send. Isolated/removable.
+- `src/text.rs` — HTML→text stripper, normalization, fuzzy `dedup_key`.
+- `src/fetchers/mod.rs` — `Fetcher` trait + `fetch_source` dispatch (the one Source→fetcher map).
+- `src/fetchers/greenhouse.rs` — Greenhouse board API (HTML descriptions, double-escaped).
+- `src/fetchers/lever.rs` — Lever postings API.
+- `src/fetchers/ashby.rs` — Ashby posting API.
+- `src/fetchers/adzuna.rs` — Adzuna search (needs `ADZUNA_APP_ID`/`ADZUNA_APP_KEY`), one query per target role.
+- `src/fetchers/remotive.rs` — Remotive aggregator by category.
+- `src/fetchers/remoteok.rs` — RemoteOK aggregator (first array element is metadata; skip it).
+- `src/fetchers/himalayas.rs` — Himalayas remote-jobs aggregator.
+- `src/fetchers/jobicy.rs` — Jobicy remote-jobs aggregator by tag.
+
+Adding a source: new file in `src/fetchers/`, a `Source` variant + `ats()`/`from_ats()` arms in
+`sources.rs`, and an arm in `fetch_source`. Aggregators get lower `db::source_priority`.
+
+## Hard rules
+
+- **Never hold a rusqlite `Connection` across an `.await`** (it is not `Send`). Open, use,
+  drop, then await. In handlers, scope the connection in a block; reopen after the await.
+  (`full_scan` holds one only because the CLI never needs `Send` — don't copy that into `server.rs`.)
+- **Never string-interpolate user input into SQL.** Use bound params (`?1`, `params![]`).
+  Sort/order values come from a fixed whitelist (see `db::search_jobs`).
+- **Never read, print, or commit `.env`, `profile.toml`, or `jobs.db`** (or `jobs.db-wal`/`-shm`,
+  resumes, logs). They are private and gitignored. Use `.env.example` / `profile.example.toml`.
+- **Fetchers fail soft.** One bad board returns `Err`, gets logged as a failure, and the scan
+  continues. Never `unwrap`/panic on network or JSON shape in a fetcher.
+- **Schema changes go through `db::migrate`** as additive, idempotent steps (add column only if
+  missing, backfill with idempotent `UPDATE`). Also update `init_schema` for fresh DBs.
+  Never drop or rename columns/tables holding user data.
+- Optional features (LLM, custom pages, email, Adzuna) must degrade to "off" with a friendly
+  message when unconfigured — never error the run.
+
+## Verify
+
+```bash
+cargo test
+cargo build --release
+./target/release/job_hunter serve   # then open http://127.0.0.1:8787
+```
+
+Tests live inline (`#[cfg(test)]`) in db, models, text, classify, score, etc.
+`serve` runs against the real local `jobs.db`/`profile.toml` — don't dump their contents.
+
+## Docs
+
+- `README.md` — public portfolio overview (repo: will825/job-hunter).
+- `PROJECT_PLAN.md` — phase history; partly stale (e.g. says Gmail/lettre, email is now Resend).
+- `scheduling/` — macOS launchd plists + `run-digest.sh`; `scheduling/linux/` systemd unit + Pi guide.
+
+## Commits
+
+One commit per task, authored as Will. Do **not** add `Co-Authored-By` trailers,
+"Generated with Claude Code" lines, or `Claude-Session` lines to commit messages.
