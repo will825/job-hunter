@@ -379,22 +379,38 @@ pub fn new_digest_matches(conn: &Connection, limit: i64) -> Result<Vec<DigestJob
          ORDER BY (tier = 'apply_now') DESC, score DESC
          LIMIT ?1",
     )?;
-    let rows = stmt
-        .query_map([limit], |r| {
-            Ok(DigestJob {
-                id: r.get(0)?,
-                company: r.get(1)?,
-                title: r.get(2)?,
-                url: r.get(3)?,
-                tier: r.get(4)?,
-                work_mode: r.get(5)?,
-                location: r.get(6)?,
-                score: r.get(7)?,
-                reasoning: r.get(8)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows = stmt.query_map([limit], row_to_digest)?.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// Fallback for a run where the LLM failed: new apply-now/strong matches by
+/// keyword tier alone (no `llm_score` required), excluding onsite roles, best
+/// keyword score first — so the digest still goes out when AI scoring is down.
+pub fn new_keyword_digest_matches(conn: &Connection, limit: i64) -> Result<Vec<DigestJob>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, company, title, url, tier, work_mode, location,
+                keyword_score AS score, llm_reasoning
+         FROM jobs
+         WHERE tier IN ('apply_now','strong') AND notified_at IS NULL AND work_mode != 'onsite'
+         ORDER BY keyword_score DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([limit], row_to_digest)?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn row_to_digest(r: &rusqlite::Row) -> rusqlite::Result<DigestJob> {
+    Ok(DigestJob {
+        id: r.get(0)?,
+        company: r.get(1)?,
+        title: r.get(2)?,
+        url: r.get(3)?,
+        tier: r.get(4)?,
+        work_mode: r.get(5)?,
+        location: r.get(6)?,
+        score: r.get(7)?,
+        reasoning: r.get(8)?,
+    })
 }
 
 /// Mark the given job ids as emailed (so they're never sent again).
@@ -721,5 +737,32 @@ mod tests {
         assert_eq!(count_jobs(&conn).unwrap(), 1);
         let url: String = conn.query_row("SELECT url FROM jobs", [], |r| r.get(0)).unwrap();
         assert_eq!(url, "ats-url", "direct ATS link should replace the aggregator link");
+    }
+
+    #[test]
+    fn keyword_fallback_picks_unscored_new_non_onsite_best_first() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let add = |title: &str, tier: &str, mode: &str, score: i64| {
+            let mut j = job("greenhouse", title, title);
+            j.tier = tier.into();
+            j.work_mode = mode.into();
+            j.keyword_score = score;
+            upsert_job(&conn, &j).unwrap();
+        };
+        add("Rust Engineer", "strong", "remote", 20);
+        add("Platform Engineer", "apply_now", "hybrid", 35);
+        add("Staff Engineer", "apply_now", "onsite", 50); // onsite: excluded
+        add("Data Engineer", "maybe", "remote", 10); // below strong: excluded
+        add("ML Engineer", "strong", "remote", 25);
+        mark_notified(&conn, &[job("greenhouse", "ML Engineer", "ML Engineer").id]).unwrap(); // already sent
+
+        // The normal digest query needs an LLM score, so it finds nothing...
+        assert!(new_digest_matches(&conn, 10).unwrap().is_empty());
+        // ...while the fallback returns keyword matches, best score first.
+        let titles: Vec<String> =
+            new_keyword_digest_matches(&conn, 10).unwrap().into_iter().map(|j| j.title).collect();
+        assert_eq!(titles, ["Platform Engineer", "Rust Engineer"]);
+        assert_eq!(new_keyword_digest_matches(&conn, 1).unwrap().len(), 1);
     }
 }

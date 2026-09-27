@@ -180,7 +180,7 @@ async fn scan(State(st): State<AppState>) -> Response {
         Ok(c) => c,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
-    let s = match pipeline::store_all(&conn, &model, fetched) {
+    let mut s = match pipeline::store_all(&conn, &model, fetched) {
         Ok(s) => s,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
@@ -188,18 +188,35 @@ async fn scan(State(st): State<AppState>) -> Response {
     // job that showed up in this scan just had its last_seen refreshed and is
     // safe from pruning — only genuinely gone postings are removed.
     let removed = db::prune_stale(&conn, pipeline::STALE_DAYS).unwrap_or(0);
+    s.pruned = removed;
     drop(conn);
 
     // Kick off LLM fit-scoring in the background so the button returns promptly
     // (fetch+store+prune only take ~40s; scoring 100 jobs would take minutes).
     // The AI scores/tiers fill in over the next minute and appear on reload.
+    // `last_run` is written once scoring finishes, so it holds the LLM counts.
     {
         let db_path = st.db_path.clone();
         let profile_path = st.profile_path.clone();
         let client = st.client.clone();
+        let mut summary = s.clone();
         tokio::spawn(async move {
-            if let Err(e) = rescore_in_background(db_path, profile_path, client).await {
-                eprintln!("background rescore failed: {e:#}");
+            let cfg = profile::load_or_create(profile_path.as_str())
+                .map(|p| llm::LlmConfig::from_profile(&p));
+            let tally = match rescore_in_background(db_path.clone(), profile_path, client).await {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("background rescore failed: {e:#}");
+                    pipeline::LlmTally { first_error: Some(format!("{e:#}")), ..Default::default() }
+                }
+            };
+            if let Ok(cfg) = cfg {
+                summary.set_llm(&cfg, &tally);
+            }
+            let saved = db::open(db_path.as_str())
+                .and_then(|conn| pipeline::record_last_run(&conn, "web", &summary));
+            if let Err(e) = saved {
+                eprintln!("couldn't record last_run: {e:#}");
             }
         });
     }
@@ -220,16 +237,18 @@ async fn scan(State(st): State<AppState>) -> Response {
 /// Background LLM re-scoring for the web "Scan now". Opens its own short-lived
 /// connections and never holds one across an await, so the future is `Send` and
 /// can be spawned. Scores the top keyword survivors, writes verdicts, and
-/// re-derives tiers from the fit scores (mirrors `pipeline::rescore_llm`).
+/// re-derives tiers from the fit scores (mirrors `pipeline::rescore_llm`,
+/// including the first-error log and circuit breaker).
 async fn rescore_in_background(
     db_path: Arc<String>,
     profile_path: Arc<String>,
     client: reqwest::Client,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<pipeline::LlmTally> {
+    let mut tally = pipeline::LlmTally::default();
     let profile = profile::load_or_create(profile_path.as_str())?;
     let cfg = llm::LlmConfig::from_profile(&profile);
     if !cfg.is_ready() {
-        return Ok(0);
+        return Ok(tally);
     }
     // 1. Read candidates, then drop the connection before any await.
     let candidates = {
@@ -237,24 +256,39 @@ async fn rescore_in_background(
         db::top_for_rescore(&conn, cfg.max_jobs_per_run)?
     };
     if candidates.is_empty() {
-        return Ok(0);
+        return Ok(tally);
     }
     // 2. Score and persist each verdict as we go. A short-lived connection per
     //    write means no connection is held across an await (keeps the future
     //    Send) and partial progress survives if the task is interrupted.
-    let mut written = 0usize;
-    for (id, company, title, description) in &candidates {
-        if let Ok(v) = llm::score_fit(&cfg, &client, &profile, title, company, description).await {
-            let conn = db::open(db_path.as_str())?;
-            db::set_llm_verdict(&conn, id, v.fit_score, &v.reasoning, &v.gaps.join("; "))?;
-            written += 1;
+    for (i, (id, company, title, description)) in candidates.iter().enumerate() {
+        if tally.should_stop() {
+            eprintln!(
+                "LLM circuit breaker: first {} calls failed — skipping the other {} job(s) this run.",
+                tally.failed,
+                candidates.len() - i
+            );
+            break;
+        }
+        match llm::score_fit(&cfg, &client, &profile, title, company, description).await {
+            Ok(v) => {
+                let conn = db::open(db_path.as_str())?;
+                db::set_llm_verdict(&conn, id, v.fit_score, &v.reasoning, &v.gaps.join("; "))?;
+                tally.ok();
+            }
+            Err(e) => {
+                if tally.fail(&e) {
+                    eprintln!("LLM error (first this run) on {title}: {e:#}");
+                }
+            }
         }
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
     }
+    eprintln!("LLM re-scored {} job(s) ({} failed).", tally.scored, tally.failed);
     // 3. Re-derive tiers from the fit scores once at the end.
     let conn = db::open(db_path.as_str())?;
     db::rederive_llm_tiers(&conn)?;
-    Ok(written)
+    Ok(tally)
 }
 
 async fn jobs(State(st): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Response {

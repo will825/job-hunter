@@ -206,7 +206,14 @@ async fn groq_json(
                     tokio::time::sleep(std::time::Duration::from_secs_f64(wait)).await;
                     continue;
                 }
-                break r.error_for_status().context("Groq returned an error status")?;
+                if !status.is_success() {
+                    // Surface the status + body: Groq explains the failure there
+                    // (decommissioned model, bad key, quota), and a bare
+                    // "error status" left failures undiagnosable for weeks.
+                    let detail = r.text().await.unwrap_or_default();
+                    return Err(anyhow!("Groq returned {status}: {}", snippet(&detail, 300)));
+                }
+                break r;
             }
             Err(e) if attempt < 4 => {
                 attempt += 1;
@@ -242,6 +249,11 @@ fn parse_json_content(content: &str) -> Result<serde_json::Value> {
     serde_json::from_str(trimmed).context("LLM did not return valid JSON")
 }
 
+/// The first `max` characters of `s` (by char, so it never splits UTF-8), trimmed.
+pub fn snippet(s: &str, max: usize) -> String {
+    s.trim().chars().take(max).collect()
+}
+
 fn truncate(s: &str, max: usize) -> &str {
     if s.len() <= max {
         s
@@ -266,6 +278,12 @@ mod tests {
         let verdict: FitVerdict = serde_json::from_value(v).unwrap();
         assert_eq!(verdict.fit_score, 82);
         assert_eq!(verdict.gaps.len(), 1);
+    }
+
+    #[test]
+    fn snippet_caps_by_chars() {
+        assert_eq!(snippet("  héllo world ", 5), "héllo");
+        assert_eq!(snippet("short", 300), "short");
     }
 
     #[test]

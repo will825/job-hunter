@@ -53,9 +53,55 @@ impl EmailConfig {
     }
 }
 
+/// How the scan behind a digest went, shown in the email's footer.
+#[derive(Debug, Clone, Default)]
+pub struct RunHealth {
+    pub boards_scanned: usize,
+    pub boards_failed: usize,
+    pub llm_enabled: bool,
+    pub llm_scored: usize,
+    pub llm_failed: usize,
+}
+
+impl RunHealth {
+    fn line(&self) -> String {
+        let ai = if self.llm_enabled {
+            format!("AI scored {}, failed {}", self.llm_scored, self.llm_failed)
+        } else {
+            "AI scoring off".to_string()
+        };
+        format!(
+            "Run health: {} boards scanned, {} failed · {ai}",
+            self.boards_scanned, self.boards_failed
+        )
+    }
+}
+
+/// Run context rendered around the job list.
+#[derive(Debug, Clone, Default)]
+pub struct DigestNotes {
+    /// Set when AI scoring failed and the digest fell back to keyword matches;
+    /// the error is shown in a banner at the top.
+    pub ai_failure: Option<String>,
+    pub health: RunHealth,
+}
+
+impl DigestNotes {
+    fn banner(&self) -> Option<String> {
+        self.ai_failure
+            .as_ref()
+            .map(|e| format!("AI scoring failed this run: {e}. These are keyword matches only."))
+    }
+}
+
 /// Send a digest of the given jobs via Resend. Assumes `cfg.is_ready()`.
-pub async fn send_digest(cfg: &EmailConfig, client: &reqwest::Client, jobs: &[DigestJob]) -> Result<()> {
-    let (subject, html, text) = compose(jobs);
+pub async fn send_digest(
+    cfg: &EmailConfig,
+    client: &reqwest::Client,
+    jobs: &[DigestJob],
+    notes: &DigestNotes,
+) -> Result<()> {
+    let (subject, html, text) = compose(jobs, notes);
     let key = cfg.api_key.as_ref().context("no RESEND_API_KEY")?;
 
     let body = json!({
@@ -83,7 +129,7 @@ pub async fn send_digest(cfg: &EmailConfig, client: &reqwest::Client, jobs: &[Di
 }
 
 /// Build (subject, html, text) for a digest of `jobs`.
-pub fn compose(jobs: &[DigestJob]) -> (String, String, String) {
+pub fn compose(jobs: &[DigestJob], notes: &DigestNotes) -> (String, String, String) {
     let apply: Vec<&DigestJob> = jobs.iter().filter(|j| j.tier == "apply_now").collect();
     let strong: Vec<&DigestJob> = jobs.iter().filter(|j| j.tier == "strong").collect();
 
@@ -96,6 +142,9 @@ pub fn compose(jobs: &[DigestJob]) -> (String, String, String) {
 
     // --- Plain text ---
     let mut text = format!("{}\n\n", subject);
+    if let Some(b) = notes.banner() {
+        text.push_str(&format!("⚠ {b}\n\n"));
+    }
     for (label, group) in [("APPLY NOW", &apply), ("STRONG", &strong)] {
         if group.is_empty() {
             continue;
@@ -110,12 +159,19 @@ pub fn compose(jobs: &[DigestJob]) -> (String, String, String) {
         }
         text.push('\n');
     }
+    text.push_str(&format!("—\n{}\n", notes.health.line()));
 
     // --- HTML ---
     let mut html = String::from(
         "<div style=\"font-family:-apple-system,system-ui,sans-serif;max-width:640px;margin:0 auto;color:#1a1a1a\">",
     );
     html.push_str(&format!("<h2 style=\"margin:0 0 4px\">{}</h2>", esc(&subject)));
+    if let Some(b) = notes.banner() {
+        html.push_str(&format!(
+            "<div style=\"background:#fff4e5;border:1px solid #f0b35a;color:#7a4b00;border-radius:6px;padding:10px 12px;margin:8px 0 12px;font-size:13px\"><b>⚠</b> {}</div>",
+            esc(&b)
+        ));
+    }
     html.push_str("<p style=\"color:#666;font-size:13px;margin:0 0 16px\">New matches since your last digest, ranked to your profile.</p>");
     for (label, color, group) in [("Apply now", "#128a4f", &apply), ("Strong", "#1f6feb", &strong)] {
         if group.is_empty() {
@@ -145,7 +201,10 @@ pub fn compose(jobs: &[DigestJob]) -> (String, String, String) {
             html.push_str("</div>");
         }
     }
-    html.push_str("<p style=\"color:#999;font-size:11px;margin-top:20px\">Sent by your local Job Hunter.</p></div>");
+    html.push_str(&format!(
+        "<p style=\"color:#999;font-size:11px;margin-top:20px\">{}<br>Sent by your local Job Hunter.</p></div>",
+        esc(&notes.health.line())
+    ));
 
     (subject, html, text)
 }
@@ -175,10 +234,40 @@ mod tests {
     #[test]
     fn compose_groups_and_counts() {
         let jobs = vec![dj("apply_now", "A", "Rust Engineer"), dj("strong", "B", "PM")];
-        let (subject, html, text) = compose(&jobs);
+        let (subject, html, text) = compose(&jobs, &DigestNotes::default());
         assert!(subject.contains("2 new matches"));
         assert!(subject.contains("1 apply-now"));
         assert!(html.contains("Apply now (1)"));
         assert!(text.contains("Rust Engineer"));
+    }
+
+    #[test]
+    fn banner_shows_when_ai_failed() {
+        let notes = DigestNotes {
+            ai_failure: Some("Groq returned 404 Not Found: <model> decommissioned".into()),
+            health: RunHealth { boards_scanned: 33, boards_failed: 2, llm_enabled: true, llm_scored: 0, llm_failed: 3 },
+        };
+        let (_subject, html, text) = compose(&[dj("strong", "A", "Rust Engineer")], &notes);
+        let banner = "AI scoring failed this run: Groq returned 404 Not Found: <model> decommissioned. \
+                      These are keyword matches only.";
+        // Banner comes before the job list in the text body...
+        let at = text.find(banner).expect("banner in text");
+        assert!(at < text.find("Rust Engineer").unwrap());
+        // ...and is HTML-escaped in the html body.
+        assert!(html.contains("AI scoring failed this run: Groq returned 404 Not Found: &lt;model&gt; decommissioned."));
+        assert!(text.contains("Run health: 33 boards scanned, 2 failed · AI scored 0, failed 3"));
+    }
+
+    #[test]
+    fn no_banner_when_llm_disabled() {
+        let notes = DigestNotes {
+            ai_failure: None,
+            health: RunHealth { boards_scanned: 5, boards_failed: 0, llm_enabled: false, ..Default::default() },
+        };
+        let (_s, html, text) = compose(&[dj("strong", "A", "Rust Engineer")], &notes);
+        assert!(!text.contains("AI scoring failed"));
+        assert!(!html.contains("AI scoring failed"));
+        assert!(text.contains("Run health: 5 boards scanned, 0 failed · AI scoring off"));
+        assert!(html.contains("AI scoring off"));
     }
 }

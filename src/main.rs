@@ -97,6 +97,7 @@ async fn cmd_scan(client: &reqwest::Client) -> Result<()> {
 
     println!("Scanning...\n");
     let summary = pipeline::full_scan(&conn, client, &profile, |line| println!("  {line}")).await?;
+    record_last_run(&conn, "scan", &summary);
 
     println!("\nSummary");
     println!("  Boards scanned:   {}", summary.boards_scanned);
@@ -106,6 +107,12 @@ async fn cmd_scan(client: &reqwest::Client) -> Result<()> {
     println!("  Already seen:     {}", summary.already_seen);
     println!("  Duplicates merged:{}", summary.merged);
     println!("  Total in DB:      {}", summary.total_in_db);
+    if summary.llm_enabled {
+        println!("  AI scored/failed: {}/{}", summary.llm_scored, summary.llm_failed);
+    }
+    if let Some(e) = &summary.llm_error {
+        println!("  AI error:         {e}");
+    }
 
     if !summary.failures.is_empty() {
         println!("\nFailures (run continued past these):");
@@ -138,7 +145,8 @@ async fn cmd_digest(client: &reqwest::Client) -> Result<()> {
     let ecfg = email::EmailConfig::from_profile(&profile);
 
     println!("Daily digest: scanning…");
-    let _ = pipeline::full_scan(&conn, client, &profile, |line| println!("  {line}")).await?;
+    let summary = pipeline::full_scan(&conn, client, &profile, |line| println!("  {line}")).await?;
+    record_last_run(&conn, "digest", &summary);
 
     // First-ever run: baseline existing matches so the first email isn't a blast
     // of everything already in the DB — only jobs appearing *after* setup count.
@@ -150,25 +158,53 @@ async fn cmd_digest(client: &reqwest::Client) -> Result<()> {
         return Ok(());
     }
 
-    let jobs = db::new_digest_matches(&conn, ecfg.max_jobs.max(1))?;
+    // Normal digests need an AI score. If the LLM is on but failed this run,
+    // fall back to keyword-tier matches (with a banner) rather than going silent.
+    let fallback = summary.llm_failed_run();
+    let limit = ecfg.max_jobs.max(1);
+    let jobs = if fallback {
+        println!("\nAI scoring failed ({}) — falling back to keyword matches.",
+            summary.llm_error.as_deref().unwrap_or("unknown error"));
+        db::new_keyword_digest_matches(&conn, limit)?
+    } else {
+        db::new_digest_matches(&conn, limit)?
+    };
+    let notes = email::DigestNotes {
+        ai_failure: if fallback { summary.llm_error.clone() } else { None },
+        health: email::RunHealth {
+            boards_scanned: summary.boards_scanned,
+            boards_failed: summary.boards_failed,
+            llm_enabled: summary.llm_enabled,
+            llm_scored: summary.llm_scored,
+            llm_failed: summary.llm_failed,
+        },
+    };
     if jobs.is_empty() {
         println!("\nNo new apply-now/strong matches since your last digest. Nothing to send.");
         return Ok(());
     }
 
     if ecfg.is_ready() {
-        email::send_digest(&ecfg, client, &jobs).await?;
+        email::send_digest(&ecfg, client, &jobs, &notes).await?;
         let ids: Vec<String> = jobs.iter().map(|j| j.id.clone()).collect();
         db::mark_notified(&conn, &ids)?;
         println!("\nEmailed {} new match(es) to {}.", jobs.len(), ecfg.to);
     } else {
         // Email not set up yet: show what *would* be sent, don't mark notified.
-        let (subject, _html, text) = email::compose(&jobs);
+        let (subject, _html, text) = email::compose(&jobs, &notes);
         println!("\n(Email off: {} — showing the digest instead)\n", ecfg.why_not_ready());
         println!("Subject: {subject}\n{text}");
         println!("(Set up [email] + EMAIL_APP_PASSWORD to have this emailed to you.)");
     }
     Ok(())
+}
+
+/// Save the run summary for the web UI. A failure here is logged, never fatal —
+/// it mustn't stop a digest from going out.
+fn record_last_run(conn: &rusqlite::Connection, trigger: &str, summary: &pipeline::ScanSummary) {
+    if let Err(e) = pipeline::record_last_run(conn, trigger, summary) {
+        eprintln!("warning: couldn't record last_run: {e:#}");
+    }
 }
 
 /// `add <url>`: detect + validate a pasted board link and watch it.
