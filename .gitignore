@@ -11,6 +11,10 @@ profile.toml
 # Local SQLite database of scraped/scored jobs
 *.db
 /jobs.db
+# SQLite WAL/shared-memory side files and the scan lock
+*.db-wal
+*.db-shm
+*.scan.lock
 # Any resume files
 *.pdf
 # Cached HTML snapshots
