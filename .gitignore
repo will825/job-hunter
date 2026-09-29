@@ -29,3 +29,6 @@ jobs_snapshot.html
 # ── OS / editor cruft ─────────────────────────────────────────
 .DS_Store
 node_modules/
+
+# Local backups of private files (profile.toml, jobs.db)
+/backups/

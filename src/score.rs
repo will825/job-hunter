@@ -52,22 +52,20 @@ const POSITIVE_CAP: i32 = 60;
 pub fn keyword_score(job: &Job, model: &ScoringModel) -> i64 {
     let title = job.title.to_lowercase();
     let desc = job.description.to_lowercase();
-    let title_tokens = tokenize(&title);
-    let desc_tokens = tokenize(&desc);
 
     let mut title_positive: Vec<i32> = Vec::new();
     let mut desc_positive = 0i32;
     let mut negative = 0i32; // penalties always apply in full, uncapped
 
     for (term, weight) in &model.weights {
-        if term_present(term, &title, &title_tokens) {
+        if term_present(term, &title) {
             if *weight >= 0 {
                 title_positive.push(*weight);
             } else {
                 negative += weight * model.title_multiplier;
             }
         }
-        if term_present(term, &desc, &desc_tokens) {
+        if term_present(term, &desc) {
             if *weight >= 0 {
                 desc_positive += weight;
             } else {
@@ -125,22 +123,43 @@ pub fn tier_for(score: i64, tiers: &Tiers) -> Tier {
     }
 }
 
-/// Whether a keyword is present: multi-word terms match as substrings;
-/// single-word terms must match a whole token.
-fn term_present(term: &str, text: &str, tokens: &[String]) -> bool {
+/// Whether a (lowercase) keyword is present in (lowercase) `text`.
+///
+/// Multi-word and hyphenated terms ("machine learning", "full-stack") match as
+/// plain substrings. Single-word terms — including ones with symbols, like
+/// "c++", "c#", "next.js", ".net" — match as a substring that stands alone:
+/// see [`standalone_at`]. So "ai" doesn't match inside "email", and "c"
+/// doesn't match inside "c++".
+fn term_present(term: &str, text: &str) -> bool {
     if term.contains(' ') || term.contains('-') {
-        text.contains(term)
-    } else {
-        tokens.iter().any(|t| t == term)
+        return text.contains(term);
     }
+    text.match_indices(term).any(|(i, _)| standalone_at(text, i, i + term.len()))
 }
 
-/// Split text into lowercase alphanumeric tokens.
-fn tokenize(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect()
+/// Whether `text[start..end]` is a whole word rather than part of a bigger
+/// one. The neighbour on each side must be missing, or whitespace/punctuation
+/// that doesn't join words: `+` and `#` join ("c" in "c++"), and so does a `.`
+/// with a word character on its far side ("node" in "node.js"), while a
+/// sentence-ending "." ("…in Rust.") doesn't.
+fn standalone_at(text: &str, start: usize, end: usize) -> bool {
+    let joins = |c: char, beyond: Option<char>| {
+        c.is_alphanumeric()
+            || c == '+'
+            || c == '#'
+            || (c == '.' && beyond.is_some_and(|b| b.is_alphanumeric()))
+    };
+    let mut before = text[..start].chars().rev();
+    let ok_before = match before.next() {
+        None => true,
+        Some(c) => !joins(c, before.next()),
+    };
+    let mut after = text[end..].chars();
+    let ok_after = match after.next() {
+        None => true,
+        Some(c) => !joins(c, after.next()),
+    };
+    ok_before && ok_after
 }
 
 #[cfg(test)]
@@ -261,6 +280,42 @@ mod tests {
         hybrid.work_mode = "hybrid".into();
         let s = keyword_score(&hybrid, &hide);
         assert_eq!(job_tier(&hybrid, s, &hide), tier_for(s, &hide.tiers));
+    }
+
+    #[test]
+    fn symbol_terms_match_in_titles() {
+        assert!(term_present("c++", "senior c++ engineer"));
+        assert!(term_present("c++", "c/c++ developer"));
+        assert!(term_present("next.js", "frontend engineer (react, next.js)"));
+        assert!(term_present("node.js", "node.js backend engineer"));
+        assert!(term_present("c#", "c#/.net developer"));
+        assert!(term_present(".net", "c#/.net developer"));
+    }
+
+    #[test]
+    fn plain_terms_do_not_match_inside_symbol_words() {
+        assert!(!term_present("c", "senior c++ engineer"));
+        assert!(!term_present("c", "c# developer"));
+        assert!(!term_present("node", "node.js engineer"));
+        assert!(!term_present("net", "asp.net developer"));
+        assert!(!term_present(".net", "asp.net developer"), "asp.net is its own word");
+        assert!(term_present("c", "c/c++ developer"), "a standalone C still counts");
+    }
+
+    #[test]
+    fn plain_terms_keep_word_boundaries() {
+        assert!(term_present("rust", "we write rust."));
+        assert!(term_present("rust", "rust-based tooling"));
+        assert!(term_present("react", "(react)"));
+        assert!(!term_present("ai", "email support"));
+        assert!(!term_present("rust", "trusted"));
+    }
+
+    #[test]
+    fn symbol_skill_counts_in_scoring() {
+        let p: Profile = toml::from_str(&PROFILE.replace(r#"common = ["sql", "java", "git"]"#, r#"common = ["c++"]"#)).unwrap();
+        let m = p.compile();
+        assert!(keyword_score(&job("C++ Developer", "desc"), &m) > keyword_score(&job("Developer", "desc"), &m));
     }
 
     #[test]
