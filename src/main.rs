@@ -45,7 +45,7 @@ const WEB_PORT: u16 = 8787;
 const ENV_FILE: &str = ".env";
 
 /// Subcommands `main` dispatches; anything else is rejected before the DB is touched.
-const KNOWN_COMMANDS: &[&str] = &["serve", "add", "list", "remove", "digest"];
+const KNOWN_COMMANDS: &[&str] = &["serve", "add", "list", "remove", "digest", "dedupe"];
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
     let command = args.first().map(String::as_str);
     if let Some(other) = command.filter(|c| !KNOWN_COMMANDS.contains(c)) {
         return Err(anyhow!(
-            "unknown command '{other}'. Use: (no args) | serve | add <url> | list | remove <id> | digest"
+            "unknown command '{other}'. Use: (no args) | serve | add <url> | list | remove <id> | digest | dedupe"
         ));
     }
 
@@ -86,6 +86,7 @@ async fn main() -> Result<()> {
         Some("list") => cmd_list(),
         Some("remove") => cmd_remove(args.get(1)),
         Some("digest") => cmd_digest(&client).await,
+        Some("dedupe") => cmd_dedupe().await,
         Some(other) => unreachable!("unknown command '{other}' rejected above"),
         None => cmd_scan(&client).await,
     }
@@ -277,6 +278,18 @@ async fn cmd_add(client: &reqwest::Client, url: Option<&String>) -> Result<()> {
              \x20  turn it on with [custom_pages] enabled = true in profile.toml, and set up Groq.)"
         );
     }
+    Ok(())
+}
+
+/// `dedupe`: collapse aggregator postings stored once per city into one row
+/// each (newer scans merge them on the way in). Holds the scan lock so it
+/// can't race a scan's writes.
+async fn cmd_dedupe() -> Result<()> {
+    let _lock = scan_lock::ScanLock::acquire_waiting(SCAN_LOCK_PATH, SCAN_LOCK_WAIT).await?;
+    let conn = db::connect(DB_PATH)?;
+    let before = db::count_jobs(&conn)?;
+    let merged = db::dedupe_aggregators(&conn)?;
+    println!("Merged {merged} duplicate aggregator row(s) ({before} → {} jobs).", db::count_jobs(&conn)?);
     Ok(())
 }
 

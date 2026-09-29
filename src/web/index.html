@@ -436,6 +436,14 @@ function reloadCurrentView(){
   if(v==='companies') loadCompanies();
 }
 
+// "+N locations" when an aggregator listed this posting in several cities;
+// hover shows them all.
+function moreLocations(j){
+  const locs = j.locations || [];
+  if(locs.length <= 1) return '';
+  return ` <span class="pill" title="${escAttr(locs.join(' · '))}">+${locs.length - 1} location${locs.length > 2 ? 's' : ''}</span>`;
+}
+
 function cardHtml(j, ctx){
   const hasAi = j.llm_score !== null && j.llm_score !== undefined;
   const score = hasAi ? j.llm_score : j.keyword_score;
@@ -460,7 +468,7 @@ function cardHtml(j, ctx){
       <div class="row"><span class="badge ${j.tier}">${j.tier.replace('_',' ')}</span>${aiTag}
       <span class="pill">${esc(j.company)}</span><span class="pill">${j.work_mode}</span>
       <span class="pill">${j.region}</span><span class="pill">${j.seniority}</span>
-      <span style="color:#6b7480">${esc(j.location)}</span></div>
+      <span style="color:#6b7480">${esc(j.location)}</span>${moreLocations(j)}</div>
       ${reason}
     </div>
     <div class="cardactions">${actions}</div>
@@ -611,7 +619,7 @@ function swipeCardInner(j){
       <div><div class="swipetitle">${esc(j.title)}</div><div class="swipeco">${esc(j.company)}</div></div></div>
     <div class="swipetags"><span class="badge ${j.tier}">${j.tier.replace('_',' ')}</span>
       <span class="pill">${j.work_mode}</span><span class="pill">${j.region}</span>
-      <span class="pill">${j.seniority}</span><span class="pill">${esc(j.location)}</span></div>
+      <span class="pill">${j.seniority}</span><span class="pill">${esc(j.location)}</span>${moreLocations(j)}</div>
     <div class="swipereason">${reason}</div>
     <div class="swipelink"><a href="${j.url}" target="_blank" rel="noopener">View full posting →</a></div>`;
 }

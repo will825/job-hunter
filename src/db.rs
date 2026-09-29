@@ -89,6 +89,8 @@ fn migrate(conn: &Connection) -> Result<()> {
         ("status", "TEXT"),
         ("note", "TEXT"),
         ("status_at", "TEXT"),
+        ("locations", "TEXT"),
+        ("title_key", "TEXT"),
     ];
     for (col, decl) in wanted {
         if !existing.contains(*col) {
@@ -104,6 +106,34 @@ fn migrate(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    // Every row starts out listing just its own location.
+    if !existing.contains("locations") {
+        conn.execute("UPDATE jobs SET locations = json_array(location) WHERE locations IS NULL", [])?;
+    }
+    // title_key is computed in Rust (it uses the text normalizers), so backfill
+    // row by row. Only rows missing it are touched, so this is a no-op after the
+    // first run.
+    backfill_title_keys(conn)?;
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_title_key ON jobs(title_key)", [])?;
+    Ok(())
+}
+
+fn backfill_title_keys(conn: &Connection) -> Result<()> {
+    let rows: Vec<(String, String, String)> = conn
+        .prepare("SELECT id, company, title FROM jobs WHERE title_key IS NULL")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    for (id, company, title) in rows {
+        tx.execute(
+            "UPDATE jobs SET title_key = ?2 WHERE id = ?1",
+            rusqlite::params![id, crate::text::title_key(&company, &title)],
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -134,7 +164,9 @@ fn init_schema(conn: &Connection) -> Result<()> {
             notified_at  TEXT,
             status       TEXT,
             note         TEXT,
-            status_at    TEXT
+            status_at    TEXT,
+            locations    TEXT,             -- JSON array; >1 entry when merged across cities
+            title_key    TEXT              -- hash of normalized company + title (no location)
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedup_key ON jobs(dedup_key);
 
@@ -218,6 +250,19 @@ pub enum Upsert {
 
 /// Source ranking for dedup collisions: prefer a direct ATS apply link over a
 /// broad aggregator repost, so the stored URL always goes to the real form.
+/// Aggregator sources, which re-list one posting once per city. Only these are
+/// merged across locations; ATS boards (greenhouse/lever/ashby) list genuinely
+/// separate openings ("Engineer I" vs "II", regional roles) and stay as they are.
+const AGGREGATORS: &[&str] = &["adzuna", "himalayas", "remoteok", "remotive", "jobicy"];
+/// `AGGREGATORS` as a SQL list, for `source IN (...)`. Fixed text, not input.
+const AGGREGATORS_SQL: &str = "('adzuna','himalayas','remoteok','remotive','jobicy')";
+/// How recently an aggregator row must have been seen to absorb a new city.
+const MERGE_WINDOW_DAYS: i64 = 30;
+
+fn is_aggregator(source: &str) -> bool {
+    AGGREGATORS.contains(&source)
+}
+
 fn source_priority(source: &str) -> i32 {
     match source {
         "greenhouse" | "lever" | "ashby" => 10, // direct ATS
@@ -271,21 +316,33 @@ pub fn upsert_job(conn: &Connection, job: &Job) -> Result<Upsert> {
         )
         .optional()?;
 
+    let title_key = crate::text::title_key(&job.company, &job.title);
     match existing {
         None => {
+            // 3. An aggregator re-listing the same posting for another city?
+            //    Fold it into the existing row as an extra location.
+            if is_aggregator(&job.source) {
+                if let Some(target) = aggregator_twin(conn, &title_key)? {
+                    add_location(conn, &target, &job.location)?;
+                    return Ok(Upsert::MergedDuplicate);
+                }
+            }
             conn.execute(
                 r#"
                 INSERT INTO jobs
                     (id, company, title, location, url, source, description,
                      posted_date, raw_json, dedup_key,
-                     work_mode, region, seniority, keyword_score, tier, last_seen)
+                     work_mode, region, seniority, keyword_score, tier, last_seen,
+                     locations, title_key)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                        ?11, ?12, ?13, ?14, ?15, datetime('now'))
+                        ?11, ?12, ?13, ?14, ?15, datetime('now'),
+                        json_array(?4), ?16)
                 "#,
                 rusqlite::params![
                     job.id, job.company, job.title, job.location, job.url,
                     job.source, job.description, job.posted_date, job.raw_json, job.dedup_key,
                     job.work_mode, job.region, job.seniority, job.keyword_score, job.tier,
+                    title_key,
                 ],
             )?;
             Ok(Upsert::Inserted)
@@ -302,13 +359,15 @@ pub fn upsert_job(conn: &Connection, job: &Job) -> Result<Upsert> {
                         url = ?6, source = ?7, description = ?8,
                         posted_date = ?9, raw_json = ?10,
                         work_mode = ?11, region = ?12, seniority = ?13,
-                        keyword_score = ?14, tier = ?15
+                        keyword_score = ?14, tier = ?15,
+                        locations = json_array(?5), title_key = ?16
                     WHERE dedup_key = ?1
                     "#,
                     rusqlite::params![
                         job.dedup_key, job.id, job.company, job.title, job.location,
                         job.url, job.source, job.description, job.posted_date, job.raw_json,
                         job.work_mode, job.region, job.seniority, job.keyword_score, job.tier,
+                        title_key,
                     ],
                 )?;
             }
@@ -322,6 +381,112 @@ pub fn upsert_job(conn: &Connection, job: &Job) -> Result<Upsert> {
             Ok(Upsert::MergedDuplicate)
         }
     }
+}
+
+/// The aggregator row a new aggregator posting with this `title_key` should
+/// merge into: seen in the last [`MERGE_WINDOW_DAYS`], preferring one you've
+/// triaged (has a status), else the oldest.
+fn aggregator_twin(conn: &Connection, title_key: &str) -> Result<Option<String>> {
+    let sql = format!(
+        "SELECT id FROM jobs
+         WHERE title_key = ?1 AND source IN {AGGREGATORS_SQL}
+           AND last_seen >= datetime('now', ?2)
+         ORDER BY (status IS NULL), first_seen, id
+         LIMIT 1"
+    );
+    let window = format!("-{MERGE_WINDOW_DAYS} days");
+    Ok(conn
+        .query_row(&sql, rusqlite::params![title_key, window], |r| r.get(0))
+        .optional()?)
+}
+
+/// A row's locations as a list (a NULL/garbled column falls back to its
+/// single `location`).
+fn parse_locations(locations: Option<&str>, location: &str) -> Vec<String> {
+    locations
+        .and_then(|l| serde_json::from_str::<Vec<String>>(l).ok())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| vec![location.to_string()])
+}
+
+/// Add `extra` to `list` unless an equivalent location is already there.
+fn merge_location(list: &mut Vec<String>, extra: &str) {
+    let key = crate::text::normalize_location(extra);
+    if !extra.trim().is_empty() && !list.iter().any(|l| crate::text::normalize_location(l) == key) {
+        list.push(extra.trim().to_string());
+    }
+}
+
+/// Record another city for row `id` and mark it seen now.
+fn add_location(conn: &Connection, id: &str, location: &str) -> Result<()> {
+    let (locations, own): (Option<String>, String) = conn.query_row(
+        "SELECT locations, location FROM jobs WHERE id = ?1",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let mut list = parse_locations(locations.as_deref(), &own);
+    merge_location(&mut list, location);
+    conn.execute(
+        "UPDATE jobs SET locations = ?2, last_seen = datetime('now') WHERE id = ?1",
+        rusqlite::params![id, serde_json::to_string(&list)?],
+    )?;
+    Ok(())
+}
+
+/// Collapse aggregator rows already stored once per city (from before
+/// upserts merged them). Groups aggregator rows by `title_key`; the keeper is
+/// one you've triaged (has a status) if any, else the oldest. Untriaged
+/// duplicates are folded into it — locations, latest last_seen, notified_at
+/// and any AI verdict it lacks — then deleted. Rows with a status are never
+/// deleted. Returns the number of rows merged away.
+pub fn dedupe_aggregators(conn: &Connection) -> Result<usize> {
+    let sql = format!(
+        "SELECT id, title_key, status IS NOT NULL, location, locations FROM jobs
+         WHERE source IN {AGGREGATORS_SQL} AND title_key IS NOT NULL
+         ORDER BY title_key, (status IS NULL), first_seen, id"
+    );
+    let rows: Vec<(String, String, bool, String, Option<String>)> = conn
+        .prepare(&sql)?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let tx = conn.unchecked_transaction()?;
+    let mut merged = 0;
+    let mut i = 0;
+    while i < rows.len() {
+        let group_end = rows[i..].iter().position(|r| r.1 != rows[i].1).map_or(rows.len(), |n| i + n);
+        let (keeper, _, _, keeper_loc, keeper_locs) = &rows[i];
+        let mut list = parse_locations(keeper_locs.as_deref(), keeper_loc);
+        for (dup, _, has_status, loc, locs) in &rows[i + 1..group_end] {
+            if *has_status {
+                continue; // triaged rows are yours — never delete them
+            }
+            for l in parse_locations(locs.as_deref(), loc) {
+                merge_location(&mut list, &l);
+            }
+            tx.execute(
+                "UPDATE jobs SET
+                    last_seen = MAX(last_seen, (SELECT last_seen FROM jobs WHERE id = ?2)),
+                    notified_at = COALESCE(notified_at, (SELECT notified_at FROM jobs WHERE id = ?2)),
+                    llm_reasoning = CASE WHEN llm_score IS NULL
+                        THEN (SELECT llm_reasoning FROM jobs WHERE id = ?2) ELSE llm_reasoning END,
+                    llm_gaps = CASE WHEN llm_score IS NULL
+                        THEN (SELECT llm_gaps FROM jobs WHERE id = ?2) ELSE llm_gaps END,
+                    llm_score = COALESCE(llm_score, (SELECT llm_score FROM jobs WHERE id = ?2))
+                 WHERE id = ?1",
+                rusqlite::params![keeper, dup],
+            )?;
+            tx.execute("DELETE FROM jobs WHERE id = ?1", [dup])?;
+            merged += 1;
+        }
+        tx.execute(
+            "UPDATE jobs SET locations = ?2 WHERE id = ?1",
+            rusqlite::params![keeper, serde_json::to_string(&list)?],
+        )?;
+        i = group_end;
+    }
+    tx.commit()?;
+    Ok(merged)
 }
 
 /// Total number of jobs currently stored (used for the run summary).
@@ -544,6 +709,8 @@ pub struct JobRow {
     pub status: Option<String>,
     pub note: Option<String>,
     pub status_at: Option<String>,
+    /// Every city this posting was listed in (always at least `location`).
+    pub locations: Vec<String>,
 }
 
 /// Set (or clear, with `None`) a job's status, recording when it changed.
@@ -572,7 +739,8 @@ pub fn set_job_note(conn: &Connection, id: &str, note: &str) -> Result<bool> {
 pub fn pipeline_jobs(conn: &Connection) -> Result<Vec<JobRow>> {
     let mut stmt = conn.prepare(
         "SELECT id, company, title, location, source, url, tier, keyword_score,
-                work_mode, region, seniority, llm_score, llm_reasoning, status, note, status_at
+                work_mode, region, seniority, llm_score, llm_reasoning, status, note, status_at,
+                locations
          FROM jobs
          WHERE status IN ('saved','applied','interviewing','offer','rejected')
          ORDER BY COALESCE(llm_score, keyword_score) DESC",
@@ -583,7 +751,7 @@ pub fn pipeline_jobs(conn: &Connection) -> Result<Vec<JobRow>> {
     Ok(rows)
 }
 
-/// Shared row → JobRow mapper for the 16-column job select.
+/// Shared row → JobRow mapper for the 17-column job select.
 fn row_to_jobrow(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
     Ok(JobRow {
         id: r.get(0)?,
@@ -602,6 +770,7 @@ fn row_to_jobrow(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
         status: r.get(13)?,
         note: r.get(14)?,
         status_at: r.get(15)?,
+        locations: parse_locations(r.get::<_, Option<String>>(16)?.as_deref(), &r.get::<_, String>(3)?),
     })
 }
 
@@ -659,7 +828,8 @@ pub fn search_jobs(
     };
     let sql = format!(
         "SELECT id, company, title, location, source, url, tier, keyword_score,
-                work_mode, region, seniority, llm_score, llm_reasoning, status, note, status_at
+                work_mode, region, seniority, llm_score, llm_reasoning, status, note, status_at,
+                locations
          FROM jobs {where_sql}
          ORDER BY {order_by} LIMIT ?"
     );
@@ -737,6 +907,121 @@ mod tests {
         rederive_llm_tiers(&conn, true).unwrap();
         assert_eq!(tier(&onsite.id), "skip");
         assert_eq!(tier(&remote.id), "apply_now");
+    }
+
+    fn located(company: &str, source: &str, title: &str, location: &str, url: &str) -> Job {
+        Job::new(company, title, location, url, source, "desc", None, "{}")
+    }
+
+    fn locations_of(conn: &Connection, id: &str) -> Vec<String> {
+        let (locs, loc): (Option<String>, String) = conn
+            .query_row("SELECT locations, location FROM jobs WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        parse_locations(locs.as_deref(), &loc)
+    }
+
+    #[test]
+    fn adzuna_city_copies_merge_into_one_row_with_both_locations() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let a = located("Saab", "adzuna", "Senior Software Engineer", "Syracuse, NY", "a1");
+        let b = located("Saab, Inc.", "adzuna", "Sr. Software Engineer", "East Syracuse, NY", "a2");
+        assert_eq!(upsert_job(&conn, &a).unwrap(), Upsert::Inserted);
+        assert_eq!(upsert_job(&conn, &b).unwrap(), Upsert::MergedDuplicate);
+        assert_eq!(count_jobs(&conn).unwrap(), 1);
+        assert_eq!(locations_of(&conn, &a.id), vec!["Syracuse, NY", "East Syracuse, NY"]);
+        // Seeing the same city again doesn't duplicate it.
+        assert_eq!(upsert_job(&conn, &b).unwrap(), Upsert::MergedDuplicate);
+        assert_eq!(locations_of(&conn, &a.id).len(), 2);
+    }
+
+    #[test]
+    fn greenhouse_levels_stay_separate_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let one = located("Co", "greenhouse", "Engineer I", "New York", "g1");
+        let two = located("Co", "greenhouse", "Engineer II", "New York", "g2");
+        assert_eq!(upsert_job(&conn, &one).unwrap(), Upsert::Inserted);
+        assert_eq!(upsert_job(&conn, &two).unwrap(), Upsert::Inserted);
+        assert_eq!(count_jobs(&conn).unwrap(), 2);
+    }
+
+    #[test]
+    fn ats_city_variants_are_not_merged() {
+        // Same title in two cities on an ATS board = two real openings.
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        upsert_job(&conn, &located("Co", "lever", "Engineer", "Austin", "l1")).unwrap();
+        upsert_job(&conn, &located("Co", "lever", "Engineer", "Denver", "l2")).unwrap();
+        assert_eq!(count_jobs(&conn).unwrap(), 2);
+    }
+
+    #[test]
+    fn stale_aggregator_row_is_not_merged_into() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let old = located("Saab", "adzuna", "Engineer", "Syracuse, NY", "a1");
+        upsert_job(&conn, &old).unwrap();
+        conn.execute("UPDATE jobs SET last_seen = datetime('now', '-31 days')", []).unwrap();
+        let new = located("Saab", "adzuna", "Engineer", "Orlando, FL", "a2");
+        assert_eq!(upsert_job(&conn, &new).unwrap(), Upsert::Inserted);
+    }
+
+    #[test]
+    fn dedupe_keeps_the_triaged_row_and_folds_in_the_rest() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        // Simulate rows stored before merging existed: insert them directly.
+        let cities = ["Syracuse, NY", "Orlando, FL", "Sterling, VA"];
+        let jobs: Vec<Job> = cities
+            .iter()
+            .enumerate()
+            .map(|(i, c)| located("Saab", "adzuna", "Senior Software Engineer", c, &format!("u{i}")))
+            .collect();
+        for (i, j) in jobs.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO jobs (id, company, title, location, url, source, description, raw_json,
+                                   dedup_key, first_seen, locations, title_key)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'd', '{}', ?7, datetime('now', ?8), json_array(?4), ?9)",
+                rusqlite::params![
+                    j.id, j.company, j.title, j.location, j.url, j.source, j.dedup_key,
+                    format!("-{} days", 10 - i),
+                    crate::text::title_key(&j.company, &j.title)
+                ],
+            )
+            .unwrap();
+        }
+        set_job_status(&conn, &jobs[1].id, Some("saved")).unwrap();
+        set_llm_verdict(&conn, &jobs[2].id, 88, "fits", "").unwrap();
+        // An unrelated ATS row is left alone.
+        upsert_job(&conn, &located("Saab", "greenhouse", "Senior Software Engineer", "Remote", "g")).unwrap();
+
+        assert_eq!(dedupe_aggregators(&conn).unwrap(), 2);
+        assert_eq!(count_jobs(&conn).unwrap(), 2);
+        let mut locs = locations_of(&conn, &jobs[1].id);
+        locs.sort();
+        assert_eq!(locs, vec!["Orlando, FL", "Sterling, VA", "Syracuse, NY"]);
+        let score: Option<i64> =
+            conn.query_row("SELECT llm_score FROM jobs WHERE id = ?1", [&jobs[1].id], |r| r.get(0)).unwrap();
+        assert_eq!(score, Some(88), "the keeper inherits an AI verdict it lacked");
+        assert_eq!(dedupe_aggregators(&conn).unwrap(), 0, "idempotent");
+    }
+
+    #[test]
+    fn migrate_backfills_locations_and_title_keys() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO jobs (id, company, title, location, url, source, description, raw_json, dedup_key)
+             VALUES ('x', 'Saab', 'Engineer', 'Syracuse', 'u', 'adzuna', 'd', '{}', 'k')",
+            [],
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let key: Option<String> = conn.query_row("SELECT title_key FROM jobs WHERE id = 'x'", [], |r| r.get(0)).unwrap();
+        assert_eq!(key.as_deref(), Some(crate::text::title_key("Saab", "Engineer").as_str()));
+        assert_eq!(locations_of(&conn, "x"), vec!["Syracuse"]);
+        migrate(&conn).unwrap();
     }
 
     #[test]

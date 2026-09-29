@@ -11,6 +11,9 @@ Runs 24/7 on a Raspberry Pi (systemd service + 7 AM digest cron); see `schedulin
 2. **Store** (sync, no network) — `pipeline::store_all` runs `enrich` on each job
    (classify work_mode/region/seniority → Stage-1 keyword score → tier), then
    `db::upsert_job` (dedup by stable `id`, then fuzzy `dedup_key`; direct ATS beats aggregators).
+   Aggregator postings re-listed per city (same `title_key` = normalized company + title, seen in
+   the last 30 days) merge into one row, appending to `locations` (JSON array). ATS rows never
+   merge across locations. `job_hunter dedupe` collapses older per-city duplicates.
 3. **Prune** — `db::prune_stale` deletes untriaged jobs (`status IS NULL`) not seen in
    `STALE_DAYS` (14). Must run *after* store so live jobs have a fresh `last_seen`.
 4. **LLM re-rank** — Groq scores the top keyword survivors (`llm_score`, reasoning, gaps);
@@ -37,7 +40,7 @@ Watched companies, Digest email, Settings. It talks to the `/api/*` JSON routes 
 
 ## Module map
 
-- `src/main.rs` — CLI entry, `.env` loader, subcommands: (none)=scan, `serve`, `add <url>`, `list`, `remove <id>`, `digest`.
+- `src/main.rs` — CLI entry, `.env` loader, subcommands: (none)=scan, `serve`, `add <url>`, `list`, `remove <id>`, `digest`, `dedupe`.
 - `src/server.rs` — axum router + JSON API handlers; binds `0.0.0.0:8787`, no auth.
 - `src/scan_lock.rs` — cross-process scan lock file (create_new; takeover when holder pid is dead).
 - `src/pipeline.rs` — fetch/store/prune/rescore orchestration, `full_scan`, Adzuna source expansion.

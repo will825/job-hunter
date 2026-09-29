@@ -230,6 +230,16 @@ pub fn dedup_key(company: &str, title: &str, location: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Hash of normalized company + title, *without* location: the key that
+/// groups one aggregator posting that was re-listed once per city.
+pub fn title_key(company: &str, title: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(normalize_company(company).as_bytes());
+    hasher.update(b"\x1f");
+    hasher.update(normalize_title(title).as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
