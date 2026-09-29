@@ -187,8 +187,10 @@ async fn groq_json(
         ]
     });
 
-    // Retry on rate-limit (429) / transient 5xx with exponential backoff, so
-    // free-tier limits don't cause skipped jobs.
+    // Retry transient rate limits (429) / 5xx with short backoff, so brief
+    // free-tier throttling doesn't skip jobs. A long Retry-After (e.g. the daily
+    // token limit, ~9 min) fails fast instead: sleeping would hold the scan lock
+    // for hours, while failing lets the circuit breaker trip in seconds.
     let mut attempt = 0u32;
     let resp = loop {
         let sent = client
@@ -200,8 +202,12 @@ async fn groq_json(
         match sent {
             Ok(r) => {
                 let status = r.status();
-                if (status.as_u16() == 429 || status.is_server_error()) && attempt < 4 {
-                    let wait = backoff_secs(&r, attempt);
+                let retry_after = r
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(parse_retry_after);
+                if let Some(wait) = retry_wait(status.as_u16(), retry_after, attempt) {
                     attempt += 1;
                     tokio::time::sleep(std::time::Duration::from_secs_f64(wait)).await;
                     continue;
@@ -211,11 +217,14 @@ async fn groq_json(
                     // (decommissioned model, bad key, quota), and a bare
                     // "error status" left failures undiagnosable for weeks.
                     let detail = r.text().await.unwrap_or_default();
-                    return Err(anyhow!("Groq returned {status}: {}", snippet(&detail, 300)));
+                    let after = retry_after
+                        .map(|s| format!(" (Retry-After {s:.0}s)"))
+                        .unwrap_or_default();
+                    return Err(anyhow!("Groq returned {status}{after}: {}", snippet(&detail, 300)));
                 }
                 break r;
             }
-            Err(e) if attempt < 4 => {
+            Err(e) if attempt < MAX_RETRIES => {
                 attempt += 1;
                 tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
                 let _ = e;
@@ -232,15 +241,27 @@ async fn groq_json(
     parse_json_content(content)
 }
 
-/// Backoff for a rate-limited response: honor `Retry-After` if present, else
-/// exponential (1, 2, 4, 8s).
-fn backoff_secs(resp: &reqwest::Response, attempt: u32) -> f64 {
-    resp.headers()
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<f64>().ok())
-        .map(|s| s.min(30.0))
-        .unwrap_or_else(|| (1u64 << attempt) as f64)
+/// Retries allowed after the first Groq request.
+const MAX_RETRIES: u32 = 4;
+/// Longest wait worth sleeping through; anything longer (e.g. a daily token
+/// limit) fails the call immediately so the breaker can trip.
+const MAX_RETRY_WAIT_SECS: f64 = 30.0;
+
+/// How long to wait before retrying a response, or `None` to stop and return
+/// it as-is. Only 429 / 5xx are retried: `Retry-After` is honored when present,
+/// else exponential (1, 2, 4, 8s). Waits over `MAX_RETRY_WAIT_SECS` give up.
+fn retry_wait(status: u16, retry_after: Option<f64>, attempt: u32) -> Option<f64> {
+    let retryable = status == 429 || (500..600).contains(&status);
+    if !retryable || attempt >= MAX_RETRIES {
+        return None;
+    }
+    let wait = retry_after.unwrap_or_else(|| (1u64 << attempt) as f64);
+    (wait <= MAX_RETRY_WAIT_SECS).then_some(wait)
+}
+
+/// `Retry-After` as delay-seconds (the form Groq sends); HTTP dates are ignored.
+fn parse_retry_after(s: &str) -> Option<f64> {
+    s.trim().parse::<f64>().ok().filter(|n| n.is_finite() && *n >= 0.0)
 }
 
 /// Parse the model's content string into JSON, tolerating stray code fences.
@@ -284,6 +305,31 @@ mod tests {
     fn snippet_caps_by_chars() {
         assert_eq!(snippet("  héllo world ", 5), "héllo");
         assert_eq!(snippet("short", 300), "short");
+    }
+
+    #[test]
+    fn retry_wait_backs_off_briefly_and_fails_fast_on_long_waits() {
+        // Transient 429 / 5xx without Retry-After: exponential backoff.
+        assert_eq!(retry_wait(429, None, 0), Some(1.0));
+        assert_eq!(retry_wait(503, None, 3), Some(8.0));
+        // Short Retry-After is honored.
+        assert_eq!(retry_wait(429, Some(2.5), 0), Some(2.5));
+        assert_eq!(retry_wait(429, Some(30.0), 1), Some(30.0));
+        // Daily token limit (~9 min) fails fast rather than sleeping.
+        assert_eq!(retry_wait(429, Some(540.0), 0), None);
+        assert_eq!(retry_wait(429, Some(30.5), 0), None);
+        // Out of attempts, success, or non-retryable client errors: stop.
+        assert_eq!(retry_wait(429, None, MAX_RETRIES), None);
+        assert_eq!(retry_wait(200, None, 0), None);
+        assert_eq!(retry_wait(401, Some(1.0), 0), None);
+    }
+
+    #[test]
+    fn parses_retry_after_seconds() {
+        assert_eq!(parse_retry_after(" 537 "), Some(537.0));
+        assert_eq!(parse_retry_after("1.25"), Some(1.25));
+        assert_eq!(parse_retry_after("-3"), None);
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), None);
     }
 
     #[test]
