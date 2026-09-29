@@ -476,17 +476,19 @@ pub fn set_llm_verdict(conn: &Connection, id: &str, fit_score: i64, reasoning: &
 /// single place tiering happens once a job has been scored — so tiers always
 /// reflect the real fit, not the LLM's inconsistent tier label. Thresholds are
 /// tuned so only genuinely strong matches reach apply_now/strong (and the
-/// digest); adjust them here to taste.
-pub fn rederive_llm_tiers(conn: &Connection) -> Result<()> {
+/// digest); adjust them here to taste. With `hide_onsite` (profile
+/// `onsite_mode = "hide"`), onsite jobs stay "skip" whatever their fit score.
+pub fn rederive_llm_tiers(conn: &Connection, hide_onsite: bool) -> Result<()> {
     conn.execute(
         "UPDATE jobs SET tier = CASE
+            WHEN ?1 AND work_mode = 'onsite' THEN 'skip'
             WHEN llm_score >= 80 THEN 'apply_now'
             WHEN llm_score >= 62 THEN 'strong'
             WHEN llm_score >= 40 THEN 'maybe'
             ELSE 'skip'
          END
          WHERE llm_score IS NOT NULL",
-        [],
+        [hide_onsite],
     )?;
     Ok(())
 }
@@ -712,6 +714,29 @@ mod tests {
         assert_eq!(count_jobs(&conn).unwrap(), 1, "second init must keep stored jobs");
         drop(conn);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hidden_onsite_jobs_stay_skip_after_llm_rederive() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let mut onsite = job("greenhouse", "Rust Engineer", "u1");
+        onsite.work_mode = "onsite".into();
+        let mut remote = job("greenhouse", "Audio Engineer", "u2");
+        remote.work_mode = "remote".into();
+        upsert_job(&conn, &onsite).unwrap();
+        upsert_job(&conn, &remote).unwrap();
+        set_llm_verdict(&conn, &onsite.id, 95, "great", "").unwrap();
+        set_llm_verdict(&conn, &remote.id, 95, "great", "").unwrap();
+        let tier = |id: &str| -> String {
+            conn.query_row("SELECT tier FROM jobs WHERE id = ?1", [id], |r| r.get(0)).unwrap()
+        };
+
+        rederive_llm_tiers(&conn, false).unwrap();
+        assert_eq!(tier(&onsite.id), "apply_now");
+        rederive_llm_tiers(&conn, true).unwrap();
+        assert_eq!(tier(&onsite.id), "skip");
+        assert_eq!(tier(&remote.id), "apply_now");
     }
 
     #[test]

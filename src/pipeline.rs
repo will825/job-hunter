@@ -305,7 +305,7 @@ pub async fn rescore_llm(
     }
 
     // Tiers are derived from the fit scores, not the LLM's tier label.
-    db::rederive_llm_tiers(conn)?;
+    db::rederive_llm_tiers(conn, profile.compile().hide_onsite)?;
     tally.tokens_est = cfg.tokens_used();
     progress(&format!("  LLM used ~{} prompt tokens this run (estimate).", tally.tokens_est));
     Ok(tally)
@@ -319,7 +319,7 @@ pub fn enrich(job: &mut Job, model: &ScoringModel) {
     job.region = cls.region;
     job.seniority = cls.seniority;
     job.keyword_score = score::keyword_score(job, model);
-    job.tier = score::tier_for(job.keyword_score, &model.tiers).as_str().to_string();
+    job.tier = score::job_tier(job, job.keyword_score, model).as_str().to_string();
 }
 
 /// How long a posting can go unseen by scans before it's pruned as expired.

@@ -8,8 +8,12 @@
 //! looks at the survivors.
 //!
 //! A term matched in the **title** counts for more than the same term in the
-//! description, because titles are denser signal — and positive description
-//! matches are capped so company boilerplate can't inflate an off-target role.
+//! description, because titles are denser signal. Positives are capped three
+//! ways so generous matching can't flood the top tier: only the best
+//! [`MAX_TITLE_MATCHES`] title terms count, description positives are capped
+//! (`desc_positive_cap`) so company boilerplate can't inflate an off-target
+//! role, and the total positive score is capped at [`POSITIVE_CAP`] before
+//! penalties. Penalties (dealbreakers, off-mode/region) always apply in full.
 
 use crate::models::Job;
 use crate::profile::{ScoringModel, Tiers};
@@ -34,13 +38,13 @@ impl Tier {
     }
 }
 
-/// Title matches are worth this multiple of a description match.
-const TITLE_MULTIPLIER: i32 = 3;
-/// Positive description matches can add at most this much. This is the key
-/// precision guard: it stops company boilerplate (e.g. "audio"/"music"/"ai" in
-/// every posting at an audio company) from lifting an off-target role — the
-/// role's real fit has to show up in the *title* to reach the top tiers.
-const DESC_POSITIVE_CAP: i32 = 12;
+/// Only this many positive title matches count (the highest-weighted ones), so
+/// a title that lists skills ("C#, Python, Rust, SQL Lead Software Engineer")
+/// can't stack them.
+const MAX_TITLE_MATCHES: usize = 2;
+/// Cap on the total positive score (title + description) before penalties, so
+/// an off-mode/off-region penalty is meaningful next to it.
+const POSITIVE_CAP: i32 = 60;
 
 /// Compute the keyword score for a job against a compiled profile model.
 ///
@@ -51,24 +55,33 @@ pub fn keyword_score(job: &Job, model: &ScoringModel) -> i64 {
     let title_tokens = tokenize(&title);
     let desc_tokens = tokenize(&desc);
 
-    let mut title_score = 0i32;
+    let mut title_positive: Vec<i32> = Vec::new();
     let mut desc_positive = 0i32;
-    let mut desc_negative = 0i32; // penalties always apply in full, uncapped
+    let mut negative = 0i32; // penalties always apply in full, uncapped
 
     for (term, weight) in &model.weights {
         if term_present(term, &title, &title_tokens) {
-            title_score += weight * TITLE_MULTIPLIER;
+            if *weight >= 0 {
+                title_positive.push(*weight);
+            } else {
+                negative += weight * model.title_multiplier;
+            }
         }
         if term_present(term, &desc, &desc_tokens) {
             if *weight >= 0 {
                 desc_positive += weight;
             } else {
-                desc_negative += weight;
+                negative += weight;
             }
         }
     }
 
-    let mut score = title_score + desc_positive.min(DESC_POSITIVE_CAP) + desc_negative;
+    // Only the best few title matches count.
+    title_positive.sort_unstable_by(|a, b| b.cmp(a));
+    let title_score: i32 =
+        title_positive.iter().take(MAX_TITLE_MATCHES).sum::<i32>() * model.title_multiplier;
+    let positive = (title_score + desc_positive.min(model.desc_positive_cap)).min(POSITIVE_CAP);
+    let mut score = positive + negative;
 
     // Preference down-ranking. Only applies when the job is *definitely* off a
     // stated preference — an "unknown" classification is never penalized, so a
@@ -87,6 +100,16 @@ pub fn keyword_score(job: &Job, model: &ScoringModel) -> i64 {
     }
 
     score as i64
+}
+
+/// The tier for a scored job: [`tier_for`] on its score, except that with
+/// `onsite_mode = "hide"` an onsite job is always `Skip`.
+pub fn job_tier(job: &Job, score: i64, model: &ScoringModel) -> Tier {
+    if model.hide_onsite && job.work_mode == "onsite" {
+        Tier::Skip
+    } else {
+        tier_for(score, &model.tiers)
+    }
 }
 
 /// Map a keyword score to a tier using the profile's thresholds.
@@ -125,22 +148,27 @@ mod tests {
     use super::*;
     use crate::profile::Profile;
 
+    const PROFILE: &str = r#"
+        target_roles = ["product engineer", "software engineer"]
+        interests = ["music", "audio"]
+        [skills]
+        strong = ["rust", "dsp", "python"]
+        medium = ["react", "ai"]
+        common = ["sql", "java", "git"]
+        [preferences]
+        work_modes = ["remote", "hybrid"]
+        regions = ["us"]
+        dealbreakers = ["security clearance"]
+        "#;
+
     fn model() -> ScoringModel {
-        // Compile the built-in default profile for tests.
-        let p: Profile = toml::from_str(
-            r#"
-            target_roles = ["product engineer", "software engineer"]
-            interests = ["music", "audio"]
-            [skills]
-            strong = ["rust", "dsp"]
-            medium = ["react", "ai"]
-            [preferences]
-            work_modes = ["remote", "hybrid"]
-            regions = ["us"]
-            dealbreakers = ["security clearance"]
-            "#,
-        )
-        .unwrap();
+        let p: Profile = toml::from_str(PROFILE).unwrap();
+        p.compile()
+    }
+
+    fn model_with(extra_prefs: &str) -> ScoringModel {
+        let text = PROFILE.replace("[preferences]", &format!("[preferences]\n{extra_prefs}"));
+        let p: Profile = toml::from_str(&text).unwrap();
         p.compile()
     }
 
@@ -179,6 +207,60 @@ mod tests {
         let with = job("Software Engineer", "Active security clearance required");
         let without = job("Software Engineer", "Great team");
         assert!(keyword_score(&with, &m) < keyword_score(&without, &m));
+    }
+
+    #[test]
+    fn title_listing_four_skills_scores_no_higher_than_two() {
+        let m = model();
+        let four = job("C#, Python, Rust, SQL Lead Software Engineer", "desc");
+        let two = job("Rust Software Engineer", "desc");
+        assert!(
+            keyword_score(&four, &m) <= keyword_score(&two, &m),
+            "four = {}, two = {}",
+            keyword_score(&four, &m),
+            keyword_score(&two, &m)
+        );
+    }
+
+    #[test]
+    fn positive_score_is_capped_before_penalties() {
+        let m = model();
+        let desc = "Rust DSP Python React AI music audio SQL git product engineer";
+        let mut remote = job("Rust Product Engineer", desc);
+        remote.work_mode = "remote".into();
+        let mut onsite = job("Rust Product Engineer", desc);
+        onsite.work_mode = "onsite".into();
+        assert_eq!(keyword_score(&remote, &m), POSITIVE_CAP as i64);
+        assert_eq!(keyword_score(&onsite, &m), (POSITIVE_CAP - 25) as i64, "penalty applies after the cap");
+    }
+
+    #[test]
+    fn common_skills_count_less_than_strong() {
+        let m = model();
+        let common = job("Engineer", "sql");
+        let strong = job("Engineer", "rust");
+        assert!(keyword_score(&common, &m) < keyword_score(&strong, &m));
+        assert!(keyword_score(&common, &m) > 0);
+    }
+
+    #[test]
+    fn onsite_job_is_skipped_when_hidden() {
+        let hide = model_with(r#"onsite_mode = "hide""#);
+        let mut onsite = job("Rust Product Engineer", "Build Rust DSP tools for music creators");
+        onsite.work_mode = "onsite".into();
+        let s = keyword_score(&onsite, &hide);
+        assert!(tier_for(s, &hide.tiers) != Tier::Skip, "score alone would not skip it");
+        assert_eq!(job_tier(&onsite, s, &hide), Tier::Skip);
+
+        // Default ("penalize"): the same job keeps its score-based tier.
+        let penalize = model();
+        let s = keyword_score(&onsite, &penalize);
+        assert_eq!(job_tier(&onsite, s, &penalize), tier_for(s, &penalize.tiers));
+        // Hybrid/remote/unknown jobs are never hidden.
+        let mut hybrid = onsite.clone();
+        hybrid.work_mode = "hybrid".into();
+        let s = keyword_score(&hybrid, &hide);
+        assert_eq!(job_tier(&hybrid, s, &hide), tier_for(s, &hide.tiers));
     }
 
     #[test]

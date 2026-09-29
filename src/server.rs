@@ -358,7 +358,7 @@ async fn rescore_in_background(
     );
     // 3. Re-derive tiers from the fit scores once at the end.
     let conn = db::connect(db_path.as_str())?;
-    db::rederive_llm_tiers(&conn)?;
+    db::rederive_llm_tiers(&conn, profile.compile().hide_onsite)?;
     Ok(tally)
 }
 

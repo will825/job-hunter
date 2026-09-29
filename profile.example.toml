@@ -31,15 +31,22 @@ target_roles = [
 # Domains you care about (a moderate positive signal).
 interests = ["climate", "developer tools", "health tech", "data infrastructure"]
 
+# Skills come in three tiers. Put a skill where it reflects how much it
+# sets you apart, not how good you are at it — a skill every posting asks
+# for can't tell a great-fit job from any other.
 [skills]
-# Your strongest, most differentiating skills (high weight).
-strong = ["python", "rust", "postgres", "kubernetes", "aws", "distributed systems"]
-# Supporting skills (moderate weight).
-medium = ["typescript", "react", "docker", "graphql", "airflow"]
+# strong: rare, differentiating skills (high weight).
+strong = ["rust", "kubernetes", "distributed systems"]
+# medium: supporting skills that narrow the field (moderate weight).
+medium = ["postgres", "typescript", "react", "graphql", "airflow"]
+# common: generic skills in almost every tech job (low weight).
+common = ["python", "aws", "docker", "git", "sql"]
 
 [preferences]
-# Preferred work modes; anything else is down-ranked (not hidden).
+# Preferred work modes; anything else is down-ranked by offmode_penalty.
 work_modes = ["remote", "hybrid"]
+# Onsite jobs: "penalize" (down-rank, default) or "hide" (always tier as skip).
+onsite_mode = "penalize"
 # Preferred regions (us, uk, emea, apac, canada, latam). Empty = no preference.
 regions = ["us"]
 # Phrases that strongly disqualify a role.
@@ -47,13 +54,16 @@ dealbreakers = ["security clearance", "on-call 24/7"]
 
 # Optional: tune the point values. Defaults shown.
 [weights]
-target_role      = 12
-strong_skill     = 10
-medium_skill     = 4
-interest         = 6
-dealbreaker      = -14
-offmode_penalty  = -6
+target_role       = 12
+strong_skill      = 10
+medium_skill      = 4
+common_skill      = 2
+interest          = 6
+dealbreaker       = -14
+offmode_penalty   = -25
 offregion_penalty = -4
+title_multiplier  = 3    # a title match counts this many times (best 2 only)
+desc_positive_cap = 12   # most the description's positive matches can add
 
 # Optional: tune the score thresholds for each tier.
 [tiers]

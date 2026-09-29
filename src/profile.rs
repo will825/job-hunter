@@ -121,11 +121,28 @@ impl Default for CustomPages {
     }
 }
 
+/// Skills in three tiers by how much they set you apart.
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 pub struct Skills {
+    /// Rare, differentiating skills — high weight.
     pub strong: Vec<String>,
+    /// Supporting skills — moderate weight.
     pub medium: Vec<String>,
+    /// Generic skills that appear in almost every tech posting (git, sql, …) —
+    /// low weight, so they can't lift an off-target role.
+    pub common: Vec<String>,
+}
+
+/// What to do with onsite jobs when onsite isn't one of your `work_modes`.
+#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OnsiteMode {
+    /// Down-rank by `offmode_penalty` (like any other non-preferred mode).
+    #[default]
+    Penalize,
+    /// Always tier onsite jobs as "skip", whatever their score.
+    Hide,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -138,6 +155,8 @@ pub struct Preferences {
     pub regions: Vec<String>,
     /// Phrases that strongly disqualify a role (e.g. "security clearance").
     pub dealbreakers: Vec<String>,
+    /// "penalize" (default) or "hide" onsite jobs.
+    pub onsite_mode: OnsiteMode,
 }
 
 /// Point values the compiled scoring model uses.
@@ -147,12 +166,18 @@ pub struct Weights {
     pub target_role: i32,
     pub strong_skill: i32,
     pub medium_skill: i32,
+    pub common_skill: i32,
     pub interest: i32,
     pub dealbreaker: i32,
     /// Penalty when a job's work_mode isn't one you prefer.
     pub offmode_penalty: i32,
     /// Penalty when a job's region isn't one you prefer.
     pub offregion_penalty: i32,
+    /// A title match is worth this many description matches.
+    pub title_multiplier: i32,
+    /// Most that positive description matches can add, so company boilerplate
+    /// can't lift an off-target role — its fit has to show in the title.
+    pub desc_positive_cap: i32,
 }
 
 impl Default for Weights {
@@ -161,10 +186,13 @@ impl Default for Weights {
             target_role: 12,
             strong_skill: 10,
             medium_skill: 4,
+            common_skill: 2,
             interest: 6,
             dealbreaker: -14,
-            offmode_penalty: -6,
+            offmode_penalty: -25,
             offregion_penalty: -4,
+            title_multiplier: 3,
+            desc_positive_cap: 12,
         }
     }
 }
@@ -296,6 +324,10 @@ pub struct ScoringModel {
     pub preferred_regions: Vec<String>,
     pub offmode_penalty: i32,
     pub offregion_penalty: i32,
+    pub title_multiplier: i32,
+    pub desc_positive_cap: i32,
+    /// `onsite_mode = "hide"`: onsite jobs always tier as skip.
+    pub hide_onsite: bool,
     pub tiers: Tiers,
 }
 
@@ -328,6 +360,9 @@ impl Profile {
         for s in &self.skills.medium {
             add(s, self.weights.medium_skill);
         }
+        for s in &self.skills.common {
+            add(s, self.weights.common_skill);
+        }
         for i in &self.interests {
             add(i, self.weights.interest);
         }
@@ -341,6 +376,9 @@ impl Profile {
             preferred_regions: lower(&self.preferences.regions),
             offmode_penalty: self.weights.offmode_penalty,
             offregion_penalty: self.weights.offregion_penalty,
+            title_multiplier: self.weights.title_multiplier,
+            desc_positive_cap: self.weights.desc_positive_cap,
+            hide_onsite: self.preferences.onsite_mode == OnsiteMode::Hide,
             tiers: self.tiers,
         }
     }
@@ -379,15 +417,22 @@ target_roles = [
 # Domains you care about (a moderate positive signal).
 interests = ["music-tech", "creator tools", "ai audio", "music", "audio"]
 
+# Skills come in three tiers. Put a skill where it reflects how much it sets you
+# apart, not how good you are at it — a skill every posting asks for can't tell
+# a great-fit job from any other.
 [skills]
-# Your strongest, most differentiating skills (high weight).
+# strong: rare, differentiating skills (high weight).
 strong = ["rust", "tauri", "dsp", "on-device", "onnx", "audio plugin", "plugin"]
-# Supporting skills (moderate weight).
-medium = ["react", "typescript", "full-stack", "ai", "machine learning", "api", "native"]
+# medium: supporting skills that narrow the field (moderate weight).
+medium = ["react", "typescript", "full-stack", "ai", "machine learning", "native"]
+# common: generic skills in almost every tech job (low weight).
+common = ["api", "git", "sql"]
 
 [preferences]
-# Preferred work modes; anything else is down-ranked (not hidden).
+# Preferred work modes; anything else is down-ranked by offmode_penalty.
 work_modes = ["remote", "hybrid"]
+# Onsite jobs: "penalize" (down-rank, default) or "hide" (always tier as skip).
+onsite_mode = "penalize"
 # Preferred regions (us, uk, emea, apac, canada, latam). Empty = no preference.
 regions = ["us"]
 # Phrases that strongly disqualify a role.
@@ -398,10 +443,13 @@ dealbreakers = ["security clearance", "clearance"]
 target_role = 12
 strong_skill = 10
 medium_skill = 4
+common_skill = 2
 interest = 6
 dealbreaker = -14
-offmode_penalty = -6
+offmode_penalty = -25
 offregion_penalty = -4
+title_multiplier = 3     # a title match counts this many times (best 2 only)
+desc_positive_cap = 12   # most the description's positive matches can add
 
 # Optional: tune the score thresholds for each tier.
 [tiers]
