@@ -15,6 +15,9 @@ Runs 24/7 on a Raspberry Pi (systemd service + 7 AM digest cron); see `schedulin
    `STALE_DAYS` (14). Must run *after* store so live jobs have a fresh `last_seen`.
 4. **LLM re-rank** — Groq scores the top keyword survivors (`llm_score`, reasoning, gaps);
    `db::rederive_llm_tiers` sets tiers from fit scores. Skipped cleanly with no `GROQ_API_KEY`.
+   Retries are short (≤20s per wait, ≤60s per call). A 429 for the daily quota (Retry-After
+   over 60s, or "per day" in the body) is `llm::QuotaExhausted`: no retries, breaker trips at
+   once, `llm_error` = "Groq daily quota used up". Estimated prompt tokens go in `last_run`.
 5. **Digest** — `job_hunter digest` emails new apply_now/strong matches via Resend, marks
    `notified_at`. First run only baselines (meta key `digest_baselined`).
 
@@ -23,7 +26,9 @@ and runs `server::run_web_scan` in a spawned task — the same steps with short-
 skipping custom pages — reporting progress in `AppState.scan` (`GET /api/scan/status`, polled by the UI).
 
 Only one scan runs at a time: every scan (CLI scan/digest and web) holds `scan_lock::ScanLock`
-on `./jobhunter.scan.lock`. The web returns 409 if it's held; the CLI waits up to 10 min. A lock
+on `./jobhunter.scan.lock`. The web returns 409 if it's held; the CLI waits up to 10 min —
+except `digest`, which skips its fetch and sends from the DB if a web scan is in "ai scoring"
+(the web scan writes its phase into the lock file). A lock
 whose pid is dead is taken over (or, if the pid can't be checked, once it's older than 30 min).
 
 Web UI is **one file**, `src/web/index.html` (inline CSS + vanilla JS), embedded via

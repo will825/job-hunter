@@ -61,6 +61,11 @@ pub struct ScanSummary {
     /// why it couldn't run at all (e.g. no key). `None` when it ran cleanly or
     /// is disabled.
     pub llm_error: Option<String>,
+    /// Groq's daily quota ran out this run (the LLM step stopped early).
+    pub llm_quota_exhausted: bool,
+    /// Estimated prompt tokens the LLM calls used (chars / 4), to watch the
+    /// daily cap.
+    pub llm_tokens_est: u64,
 }
 
 impl ScanSummary {
@@ -69,6 +74,8 @@ impl ScanSummary {
         self.llm_enabled = cfg.enabled;
         self.llm_scored = tally.scored;
         self.llm_failed = tally.failed;
+        self.llm_quota_exhausted = tally.quota_exhausted;
+        self.llm_tokens_est = tally.tokens_est;
         self.llm_error = if cfg.enabled && !cfg.is_ready() {
             Some(cfg.why_not_ready().to_string())
         } else {
@@ -76,11 +83,12 @@ impl ScanSummary {
         };
     }
 
-    /// The LLM is enabled but produced no scores this run because it failed —
-    /// the digest's cue to fall back to keyword matches. (Zero scores with no
-    /// error just means there was nothing new to score.)
+    /// The LLM is enabled but failed this run — produced no scores, or ran out
+    /// of daily quota part-way — the digest's cue to fall back to keyword
+    /// matches. (Zero scores with no error just means nothing new to score.)
     pub fn llm_failed_run(&self) -> bool {
-        self.llm_enabled && self.llm_scored == 0 && self.llm_error.is_some()
+        self.llm_enabled
+            && (self.llm_quota_exhausted || (self.llm_scored == 0 && self.llm_error.is_some()))
     }
 }
 
@@ -94,24 +102,46 @@ pub struct LlmTally {
     pub first_error: Option<String>,
     /// The breaker opened and remaining candidates were skipped.
     pub tripped: bool,
+    /// Groq's daily quota ran out (trips the breaker immediately).
+    pub quota_exhausted: bool,
+    /// Estimated prompt tokens used by this run's calls.
+    pub tokens_est: u64,
 }
 
 impl LlmTally {
     pub const BREAKER: usize = 3;
+    /// `llm_error` when the daily quota runs out — shown in the digest banner.
+    pub const QUOTA_MSG: &'static str = "Groq daily quota used up";
 
     pub fn ok(&mut self) {
         self.scored += 1;
     }
 
-    /// Record a failed call. Returns `true` for the run's first failure, which
-    /// the caller should log in full.
+    /// Record a failed call. Returns `true` for the run's first failure (or
+    /// the quota running out), which the caller should log in full. A spent
+    /// daily quota trips the breaker at once — no point trying other jobs.
     pub fn fail(&mut self, e: &anyhow::Error) -> bool {
         self.failed += 1;
+        if llm::is_quota_exhausted(e) && !self.quota_exhausted {
+            self.quota_exhausted = true;
+            self.tripped = true;
+            self.first_error = Some(Self::QUOTA_MSG.to_string());
+            return true;
+        }
         if self.first_error.is_none() {
             self.first_error = Some(format!("{e:#}"));
             true
         } else {
             false
+        }
+    }
+
+    /// Why the breaker opened, for the log line.
+    pub fn stop_reason(&self) -> String {
+        if self.quota_exhausted {
+            format!("LLM stopped: {}", Self::QUOTA_MSG)
+        } else {
+            format!("LLM circuit breaker: first {} calls failed", self.failed)
         }
     }
 
@@ -158,6 +188,8 @@ pub fn summary_json(trigger: &str, s: &ScanSummary) -> serde_json::Value {
         "llm_scored": s.llm_scored,
         "llm_failed": s.llm_failed,
         "llm_error": s.llm_error,
+        "llm_quota_exhausted": s.llm_quota_exhausted,
+        "llm_tokens_est": s.llm_tokens_est,
         "board_errors": board_errors,
     })
 }
@@ -250,11 +282,7 @@ pub async fn rescore_llm(
 
     for (i, (id, company, title, description)) in candidates.iter().enumerate() {
         if tally.should_stop() {
-            progress(&format!(
-                "  LLM circuit breaker: first {} calls failed — skipping the other {} job(s) this run.",
-                tally.failed,
-                candidates.len() - i
-            ));
+            progress(&format!("  {} — skipping the other {} job(s) this run.", tally.stop_reason(), candidates.len() - i));
             break;
         }
         match llm::score_fit(cfg, client, profile, title, company, description).await {
@@ -278,6 +306,8 @@ pub async fn rescore_llm(
 
     // Tiers are derived from the fit scores, not the LLM's tier label.
     db::rederive_llm_tiers(conn)?;
+    tally.tokens_est = cfg.tokens_used();
+    progress(&format!("  LLM used ~{} prompt tokens this run (estimate).", tally.tokens_est));
     Ok(tally)
 }
 
@@ -380,13 +410,22 @@ mod tests {
     use super::*;
 
     fn cfg(enabled: bool, key: Option<&str>) -> LlmConfig {
-        LlmConfig {
-            enabled,
-            provider: "groq".into(),
-            model: "m".into(),
-            max_jobs_per_run: 30,
-            api_key: key.map(String::from),
-        }
+        LlmConfig::for_test(enabled, key)
+    }
+
+    #[test]
+    fn quota_exhausted_trips_breaker_at_once_and_forces_fallback() {
+        let mut t = LlmTally::default();
+        t.ok();
+        let quota = anyhow::Error::new(llm::QuotaExhausted { detail: "429".into() });
+        assert!(t.fail(&quota), "quota running out is logged");
+        assert!(t.should_stop(), "one quota error is enough to stop");
+        assert_eq!(t.first_error.as_deref(), Some(LlmTally::QUOTA_MSG));
+
+        let mut s = ScanSummary::default();
+        s.set_llm(&cfg(true, Some("k")), &t);
+        assert_eq!(s.llm_error.as_deref(), Some("Groq daily quota used up"));
+        assert!(s.llm_failed_run(), "quota exhaustion falls back even after some scores");
     }
 
     #[test]

@@ -12,19 +12,51 @@
 //! errors, and the tool runs fine on keyword scoring alone. To remove the whole
 //! feature: delete this file and the two call sites in `pipeline.rs`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::profile::Profile;
 
-/// Resolved LLM configuration (profile settings + env-provided key).
+/// Groq's OpenAI-compatible chat-completions endpoint.
+const GROQ_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
+
+/// Resolved LLM configuration (profile settings + env-provided key). Built once
+/// per run, so it also carries that run's estimated token usage.
 pub struct LlmConfig {
     pub enabled: bool,
     pub provider: String,
     pub model: String,
     pub max_jobs_per_run: i64,
     pub api_key: Option<String>,
+    /// Chat-completions endpoint (Groq; overridden in tests).
+    pub api_url: String,
+    /// Estimated prompt tokens sent by successful calls this run.
+    tokens_est: AtomicU64,
+}
+
+/// Groq refused because the account's daily quota (tokens or requests per
+/// day) is used up. Retrying won't help until it resets, so the caller should
+/// stop calling the LLM for the rest of the run.
+#[derive(Debug)]
+pub struct QuotaExhausted {
+    pub detail: String,
+}
+
+impl std::fmt::Display for QuotaExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Groq daily quota used up: {}", self.detail)
+    }
+}
+
+impl std::error::Error for QuotaExhausted {}
+
+/// Whether `e` (anywhere in its chain) is a [`QuotaExhausted`].
+pub fn is_quota_exhausted(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<QuotaExhausted>())
 }
 
 impl LlmConfig {
@@ -36,7 +68,28 @@ impl LlmConfig {
             model: p.llm.model.clone(),
             max_jobs_per_run: p.llm.max_jobs_per_run,
             api_key: std::env::var("GROQ_API_KEY").ok().filter(|k| !k.trim().is_empty()),
+            api_url: GROQ_URL.to_string(),
+            tokens_est: AtomicU64::new(0),
         }
+    }
+
+    /// A ready-to-use config for tests.
+    #[cfg(test)]
+    pub fn for_test(enabled: bool, api_key: Option<&str>) -> Self {
+        LlmConfig {
+            enabled,
+            provider: "groq".into(),
+            model: "test".into(),
+            max_jobs_per_run: 30,
+            api_key: api_key.map(String::from),
+            api_url: GROQ_URL.to_string(),
+            tokens_est: AtomicU64::new(0),
+        }
+    }
+
+    /// Estimated prompt tokens this run's successful calls have used.
+    pub fn tokens_used(&self) -> u64 {
+        self.tokens_est.load(Ordering::Relaxed)
     }
 
     /// Whether the LLM is actually usable right now (enabled + provider + key).
@@ -188,13 +241,14 @@ async fn groq_json(
     });
 
     // Retry transient rate limits (429) / 5xx with short backoff, so brief
-    // free-tier throttling doesn't skip jobs. A long Retry-After (e.g. the daily
-    // token limit, ~9 min) fails fast instead: sleeping would hold the scan lock
-    // for hours, while failing lets the circuit breaker trip in seconds.
+    // free-tier throttling doesn't skip jobs. The daily quota fails fast with
+    // `QuotaExhausted` instead: sleeping through a ~9 min Retry-After would hold
+    // the scan lock for hours, while failing lets the breaker trip at once.
+    let started = Instant::now();
     let mut attempt = 0u32;
     let resp = loop {
         let sent = client
-            .post("https://api.groq.com/openai/v1/chat/completions")
+            .post(&cfg.api_url)
             .bearer_auth(key)
             .json(&body)
             .send()
@@ -202,36 +256,50 @@ async fn groq_json(
         match sent {
             Ok(r) => {
                 let status = r.status();
+                if status.is_success() {
+                    break r;
+                }
                 let retry_after = r
                     .headers()
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|v| v.to_str().ok())
                     .and_then(parse_retry_after);
-                if let Some(wait) = retry_wait(status.as_u16(), retry_after, attempt) {
+                // Surface the status + body: Groq explains the failure there
+                // (decommissioned model, bad key, quota), and a bare
+                // "error status" left failures undiagnosable for weeks.
+                let detail = r.text().await.unwrap_or_default();
+                let after = retry_after
+                    .map(|s| format!(" (Retry-After {s:.0}s)"))
+                    .unwrap_or_default();
+                if status.as_u16() == 429 && is_daily_quota(retry_after, &detail) {
+                    return Err(anyhow::Error::new(QuotaExhausted {
+                        detail: format!("{status}{after}: {}", snippet(&detail, 300)),
+                    }));
+                }
+                match retry_wait(status.as_u16(), retry_after, attempt, started.elapsed()) {
+                    Some(wait) => {
+                        attempt += 1;
+                        tokio::time::sleep(Duration::from_secs_f64(wait)).await;
+                    }
+                    None => {
+                        return Err(anyhow!("Groq returned {status}{after}: {}", snippet(&detail, 300)));
+                    }
+                }
+            }
+            Err(e) => match retry_wait(503, None, attempt, started.elapsed()) {
+                // Network errors back off like a transient 5xx.
+                Some(wait) => {
                     attempt += 1;
-                    tokio::time::sleep(std::time::Duration::from_secs_f64(wait)).await;
-                    continue;
+                    tokio::time::sleep(Duration::from_secs_f64(wait)).await;
                 }
-                if !status.is_success() {
-                    // Surface the status + body: Groq explains the failure there
-                    // (decommissioned model, bad key, quota), and a bare
-                    // "error status" left failures undiagnosable for weeks.
-                    let detail = r.text().await.unwrap_or_default();
-                    let after = retry_after
-                        .map(|s| format!(" (Retry-After {s:.0}s)"))
-                        .unwrap_or_default();
-                    return Err(anyhow!("Groq returned {status}{after}: {}", snippet(&detail, 300)));
-                }
-                break r;
-            }
-            Err(e) if attempt < MAX_RETRIES => {
-                attempt += 1;
-                tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
-                let _ = e;
-            }
-            Err(e) => return Err(anyhow::Error::new(e).context("calling Groq")),
+                None => return Err(anyhow::Error::new(e).context("calling Groq")),
+            },
         }
     };
+
+    let tokens = estimate_tokens(system, user);
+    let total = cfg.tokens_est.fetch_add(tokens, Ordering::Relaxed) + tokens;
+    eprintln!("LLM call ~{tokens} prompt tokens (run total ~{total})");
 
     let v: serde_json::Value = resp.json().await.context("reading Groq response")?;
     let content = v
@@ -243,20 +311,41 @@ async fn groq_json(
 
 /// Retries allowed after the first Groq request.
 const MAX_RETRIES: u32 = 4;
-/// Longest wait worth sleeping through; anything longer (e.g. a daily token
-/// limit) fails the call immediately so the breaker can trip.
-const MAX_RETRY_WAIT_SECS: f64 = 30.0;
+/// Longest single wait between retries; a longer Retry-After is clamped.
+const MAX_RETRY_WAIT_SECS: f64 = 20.0;
+/// Total time one call may spend retrying before it gives up.
+const MAX_RETRY_TOTAL: Duration = Duration::from_secs(60);
+/// A 429 asking us to wait longer than this is a quota, not a blip.
+const QUOTA_RETRY_AFTER_SECS: f64 = 60.0;
 
-/// How long to wait before retrying a response, or `None` to stop and return
-/// it as-is. Only 429 / 5xx are retried: `Retry-After` is honored when present,
-/// else exponential (1, 2, 4, 8s). Waits over `MAX_RETRY_WAIT_SECS` give up.
-fn retry_wait(status: u16, retry_after: Option<f64>, attempt: u32) -> Option<f64> {
+/// Whether a 429 means the daily quota is spent: a long Retry-After, or Groq
+/// saying so in the body ("tokens per day (TPD)", "requests per day (RPD)").
+fn is_daily_quota(retry_after: Option<f64>, body: &str) -> bool {
+    let body = body.to_lowercase();
+    retry_after.is_some_and(|s| s > QUOTA_RETRY_AFTER_SECS)
+        || body.contains("per day")
+        || body.contains("(tpd)")
+        || body.contains("(rpd)")
+}
+
+/// How long to wait before retrying a failed response, or `None` to give up.
+/// Only 429 / 5xx are retried: `Retry-After` is honored (clamped to
+/// `MAX_RETRY_WAIT_SECS`), else exponential (1, 2, 4, 8s). Gives up after
+/// `MAX_RETRIES` or when the wait would push the call past `MAX_RETRY_TOTAL`.
+fn retry_wait(status: u16, retry_after: Option<f64>, attempt: u32, elapsed: Duration) -> Option<f64> {
     let retryable = status == 429 || (500..600).contains(&status);
     if !retryable || attempt >= MAX_RETRIES {
         return None;
     }
-    let wait = retry_after.unwrap_or_else(|| (1u64 << attempt) as f64);
-    (wait <= MAX_RETRY_WAIT_SECS).then_some(wait)
+    let wait = retry_after
+        .unwrap_or_else(|| (1u64 << attempt) as f64)
+        .min(MAX_RETRY_WAIT_SECS);
+    (elapsed + Duration::from_secs_f64(wait) <= MAX_RETRY_TOTAL).then_some(wait)
+}
+
+/// Rough prompt size in tokens (~4 chars per token), for tracking daily usage.
+fn estimate_tokens(system: &str, user: &str) -> u64 {
+    ((system.chars().count() + user.chars().count()) / 4) as u64
 }
 
 /// `Retry-After` as delay-seconds (the form Groq sends); HTTP dates are ignored.
@@ -308,20 +397,70 @@ mod tests {
     }
 
     #[test]
-    fn retry_wait_backs_off_briefly_and_fails_fast_on_long_waits() {
+    fn retry_wait_backs_off_briefly_within_caps() {
+        let t0 = Duration::ZERO;
         // Transient 429 / 5xx without Retry-After: exponential backoff.
-        assert_eq!(retry_wait(429, None, 0), Some(1.0));
-        assert_eq!(retry_wait(503, None, 3), Some(8.0));
-        // Short Retry-After is honored.
-        assert_eq!(retry_wait(429, Some(2.5), 0), Some(2.5));
-        assert_eq!(retry_wait(429, Some(30.0), 1), Some(30.0));
-        // Daily token limit (~9 min) fails fast rather than sleeping.
-        assert_eq!(retry_wait(429, Some(540.0), 0), None);
-        assert_eq!(retry_wait(429, Some(30.5), 0), None);
-        // Out of attempts, success, or non-retryable client errors: stop.
-        assert_eq!(retry_wait(429, None, MAX_RETRIES), None);
-        assert_eq!(retry_wait(200, None, 0), None);
-        assert_eq!(retry_wait(401, Some(1.0), 0), None);
+        assert_eq!(retry_wait(429, None, 0, t0), Some(1.0));
+        assert_eq!(retry_wait(503, None, 3, t0), Some(8.0));
+        // Short Retry-After is honored; longer ones are clamped to 20s.
+        assert_eq!(retry_wait(429, Some(2.5), 0, t0), Some(2.5));
+        assert_eq!(retry_wait(429, Some(45.0), 1, t0), Some(20.0));
+        // A wait that would push the call past 60s total gives up.
+        assert_eq!(retry_wait(429, Some(20.0), 1, Duration::from_secs(40)), Some(20.0));
+        assert_eq!(retry_wait(429, Some(20.0), 1, Duration::from_secs(41)), None);
+        // Out of attempts, or non-retryable client errors: stop.
+        assert_eq!(retry_wait(429, None, MAX_RETRIES, t0), None);
+        assert_eq!(retry_wait(401, Some(1.0), 0, t0), None);
+    }
+
+    #[test]
+    fn daily_quota_is_recognised() {
+        assert!(is_daily_quota(Some(540.0), ""));
+        assert!(is_daily_quota(None, "Rate limit reached ... on tokens per day (TPD): Limit 200000"));
+        assert!(is_daily_quota(None, "on requests per day (RPD)"));
+        assert!(!is_daily_quota(Some(2.0), "Rate limit reached ... on tokens per minute (TPM)"));
+        assert!(!is_daily_quota(None, ""));
+    }
+
+    #[test]
+    fn estimates_tokens_from_chars() {
+        assert_eq!(estimate_tokens("abcd", "efghijkl"), 3);
+    }
+
+    /// Serve one canned HTTP response on a local port; returns its URL.
+    async fn one_shot_server(response: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 16 * 1024];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+        format!("http://{addr}/v1/chat/completions")
+    }
+
+    #[tokio::test]
+    async fn long_retry_after_429_is_quota_exhausted_without_sleeping() {
+        let body = r#"{"error":{"message":"Rate limit reached"}}"#;
+        let resp: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 540\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_boxed_str(),
+        );
+        let mut cfg = LlmConfig::for_test(true, Some("test-key"));
+        cfg.api_url = one_shot_server(resp).await;
+        let started = Instant::now();
+        let err = groq_json(&cfg, &reqwest::Client::new(), "sys", "user").await.unwrap_err();
+        assert!(is_quota_exhausted(&err), "expected QuotaExhausted, got: {err:#}");
+        assert!(started.elapsed() < Duration::from_secs(2), "must not sleep on a daily quota");
+        assert_eq!(cfg.tokens_used(), 0, "a refused call uses no tokens");
     }
 
     #[test]

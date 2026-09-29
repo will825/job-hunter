@@ -22,6 +22,46 @@ pub const STALE_AFTER: Duration = Duration::from_secs(30 * 60);
 #[derive(Debug)]
 pub struct ScanLock {
     path: PathBuf,
+    /// When the lock was taken (unix secs), kept in the file's first line.
+    since: u64,
+}
+
+/// What a lock file says about its holder: "web" scans record their phase so
+/// the digest can decide whether waiting is worthwhile. CLI scans record none.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct HolderInfo {
+    pub holder: Option<String>,
+    pub phase: Option<String>,
+}
+
+impl HolderInfo {
+    /// The lock is held by a web scan that's past fetching and storing, only
+    /// LLM re-scoring remains.
+    pub fn is_web_ai_scoring(&self) -> bool {
+        self.holder.as_deref() == Some("web") && self.phase.as_deref() == Some("ai scoring")
+    }
+
+    /// Read a lock file's holder/phase lines. `None` if there's no lock.
+    pub fn read(path: impl AsRef<Path>) -> Option<HolderInfo> {
+        let text = fs::read_to_string(path).ok()?;
+        let mut info = HolderInfo::default();
+        for line in text.lines() {
+            if let Some(v) = line.strip_prefix("holder ") {
+                info.holder = Some(v.trim().to_string());
+            } else if let Some(v) = line.strip_prefix("phase ") {
+                info.phase = Some(v.trim().to_string());
+            }
+        }
+        Some(info)
+    }
+}
+
+/// Result of [`ScanLock::acquire_waiting_unless`].
+#[derive(Debug)]
+pub enum Acquired {
+    Lock(ScanLock),
+    /// Didn't wait: the holder matched the caller's skip condition.
+    Skipped,
 }
 
 impl ScanLock {
@@ -32,10 +72,10 @@ impl ScanLock {
         for _ in 0..2 {
             match OpenOptions::new().write(true).create_new(true).open(path) {
                 Ok(mut f) => {
-                    // Informational only — who holds it and since when.
                     // "pid N at T" — the pid drives the dead-holder check.
-                    let _ = writeln!(f, "pid {} at {}", std::process::id(), unix_now());
-                    return Ok(Some(ScanLock { path: path.to_path_buf() }));
+                    let since = unix_now();
+                    let _ = writeln!(f, "pid {} at {since}", std::process::id());
+                    return Ok(Some(ScanLock { path: path.to_path_buf(), since }));
                 }
                 Err(e) if e.kind() == ErrorKind::AlreadyExists => {
                     if !is_stale(path) {
@@ -55,15 +95,38 @@ impl ScanLock {
         Ok(None)
     }
 
+    /// Record who holds the lock and what it's doing, for other processes to
+    /// read with [`HolderInfo::read`]. Best effort: a failed write is ignored.
+    pub fn set_phase(&self, holder: &str, phase: &str) {
+        let text = format!("pid {} at {}\nholder {holder}\nphase {phase}\n", std::process::id(), self.since);
+        let _ = fs::write(&self.path, text);
+    }
+
     /// Wait (polling) up to `timeout` for the lock. Errors with a clear message
     /// if another scan still holds it after that.
     pub async fn acquire_waiting(path: impl AsRef<Path>, timeout: Duration) -> Result<ScanLock> {
+        match Self::acquire_waiting_unless(path, timeout, |_| false).await? {
+            Acquired::Lock(lock) => Ok(lock),
+            Acquired::Skipped => unreachable!("skip condition is always false"),
+        }
+    }
+
+    /// Like [`ScanLock::acquire_waiting`], but returns `Skipped` straight away
+    /// (checked on every poll) once the holder matches `skip_if`.
+    pub async fn acquire_waiting_unless(
+        path: impl AsRef<Path>,
+        timeout: Duration,
+        skip_if: impl Fn(&HolderInfo) -> bool,
+    ) -> Result<Acquired> {
         let path = path.as_ref();
         let deadline = tokio::time::Instant::now() + timeout;
         let mut announced = false;
         loop {
             if let Some(lock) = Self::try_acquire(path)? {
-                return Ok(lock);
+                return Ok(Acquired::Lock(lock));
+            }
+            if HolderInfo::read(path).is_some_and(|i| skip_if(&i)) {
+                return Ok(Acquired::Skipped);
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(anyhow!(
@@ -153,6 +216,31 @@ mod tests {
         assert!(!p.exists(), "dropping the guard removes the file");
         let again = ScanLock::try_acquire(&p).unwrap();
         assert!(again.is_some(), "released lock is free again");
+    }
+
+    #[test]
+    fn web_phase_is_readable_by_other_processes() {
+        let p = temp_lock("phase");
+        let lock = ScanLock::try_acquire(&p).unwrap().unwrap();
+        assert!(!HolderInfo::read(&p).unwrap().is_web_ai_scoring());
+        lock.set_phase("web", "ai scoring");
+        let info = HolderInfo::read(&p).unwrap();
+        assert!(info.is_web_ai_scoring());
+        // Still recognised as held by a live pid after the rewrite.
+        assert!(ScanLock::try_acquire(&p).unwrap().is_none());
+        drop(lock);
+        assert_eq!(HolderInfo::read(&p), None);
+    }
+
+    #[tokio::test]
+    async fn waiting_is_skipped_for_a_web_scan_in_ai_scoring() {
+        let p = temp_lock("skip");
+        let lock = ScanLock::try_acquire(&p).unwrap().unwrap();
+        lock.set_phase("web", "ai scoring");
+        let got = ScanLock::acquire_waiting_unless(&p, Duration::from_secs(600), HolderInfo::is_web_ai_scoring)
+            .await
+            .unwrap();
+        assert!(matches!(got, Acquired::Skipped));
     }
 
     #[test]

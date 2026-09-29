@@ -138,6 +138,9 @@ async fn cmd_scan(client: &reqwest::Client) -> Result<()> {
     if summary.llm_enabled {
         println!("  AI scored/failed: {}/{}", summary.llm_scored, summary.llm_failed);
     }
+    if summary.llm_enabled {
+        println!("  AI tokens (est.): ~{}", summary.llm_tokens_est);
+    }
     if let Some(e) = &summary.llm_error {
         println!("  AI error:         {e}");
     }
@@ -168,14 +171,33 @@ async fn cmd_scan(client: &reqwest::Client) -> Result<()> {
 /// `digest`: the daily run — scan, then email only the NEW apply-now/strong
 /// matches since last time (marking them so they're never re-sent).
 async fn cmd_digest(client: &reqwest::Client) -> Result<()> {
-    let _lock = scan_lock::ScanLock::acquire_waiting(SCAN_LOCK_PATH, SCAN_LOCK_WAIT).await?;
+    // If a web scan is already down to AI scoring, its fetch is done and the DB
+    // is fresh — don't wait on the LLM (which can be slow or out of quota); send
+    // from what's stored so the email still goes out.
+    let lock = scan_lock::ScanLock::acquire_waiting_unless(
+        SCAN_LOCK_PATH,
+        SCAN_LOCK_WAIT,
+        scan_lock::HolderInfo::is_web_ai_scoring,
+    )
+    .await?;
     let conn = db::connect(DB_PATH)?;
     let profile = profile::load_or_create(PROFILE_PATH)?;
     let ecfg = email::EmailConfig::from_profile(&profile);
 
-    println!("Daily digest: scanning…");
-    let summary = pipeline::full_scan(&conn, client, &profile, |line| println!("  {line}")).await?;
-    record_last_run(&conn, "digest", &summary);
+    let (summary, from_db_only) = match lock {
+        scan_lock::Acquired::Lock(_lock) => {
+            println!("Daily digest: scanning…");
+            let summary = pipeline::full_scan(&conn, client, &profile, |line| println!("  {line}")).await?;
+            record_last_run(&conn, "digest", &summary);
+            (summary, false)
+        }
+        scan_lock::Acquired::Skipped => {
+            println!("Daily digest: a web scan is AI-scoring — skipping the fetch and sending from stored jobs.");
+            let cfg = llm::LlmConfig::from_profile(&profile);
+            let summary = pipeline::ScanSummary { llm_enabled: cfg.enabled, ..Default::default() };
+            (summary, true)
+        }
+    };
 
     // First-ever run: baseline existing matches so the first email isn't a blast
     // of everything already in the DB — only jobs appearing *after* setup count.
@@ -206,6 +228,7 @@ async fn cmd_digest(client: &reqwest::Client) -> Result<()> {
             llm_enabled: summary.llm_enabled,
             llm_scored: summary.llm_scored,
             llm_failed: summary.llm_failed,
+            from_db_only,
         },
     };
     if jobs.is_empty() {

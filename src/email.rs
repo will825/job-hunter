@@ -61,10 +61,18 @@ pub struct RunHealth {
     pub llm_enabled: bool,
     pub llm_scored: usize,
     pub llm_failed: usize,
+    /// The digest skipped its own scan (a web scan was mid AI-scoring) and was
+    /// built from the jobs already stored.
+    pub from_db_only: bool,
 }
 
 impl RunHealth {
     fn line(&self) -> String {
+        if self.from_db_only {
+            return "Run health: sent from stored jobs — a web scan was still AI-scoring, \
+                    so this digest skipped its own fetch."
+                .to_string();
+        }
         let ai = if self.llm_enabled {
             format!("AI scored {}, failed {}", self.llm_scored, self.llm_failed)
         } else {
@@ -245,7 +253,7 @@ mod tests {
     fn banner_shows_when_ai_failed() {
         let notes = DigestNotes {
             ai_failure: Some("Groq returned 404 Not Found: <model> decommissioned".into()),
-            health: RunHealth { boards_scanned: 33, boards_failed: 2, llm_enabled: true, llm_scored: 0, llm_failed: 3 },
+            health: RunHealth { boards_scanned: 33, boards_failed: 2, llm_enabled: true, llm_scored: 0, llm_failed: 3, from_db_only: false },
         };
         let (_subject, html, text) = compose(&[dj("strong", "A", "Rust Engineer")], &notes);
         let banner = "AI scoring failed this run: Groq returned 404 Not Found: <model> decommissioned. \
@@ -269,5 +277,11 @@ mod tests {
         assert!(!html.contains("AI scoring failed"));
         assert!(text.contains("Run health: 5 boards scanned, 0 failed · AI scoring off"));
         assert!(html.contains("AI scoring off"));
+    }
+
+    #[test]
+    fn db_only_digest_says_it_skipped_the_fetch() {
+        let health = RunHealth { from_db_only: true, llm_enabled: true, ..Default::default() };
+        assert!(health.line().contains("skipped its own fetch"));
     }
 }

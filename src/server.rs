@@ -194,7 +194,7 @@ async fn scan(State(st): State<AppState>) -> Response {
             return err(StatusCode::CONFLICT, BUSY);
         }
         let lock = match ScanLock::try_acquire(st.lock_path.as_str()) {
-            Ok(Some(lock)) => lock,
+            Ok(Some(lock)) => Arc::new(lock),
             Ok(None) => return err(StatusCode::CONFLICT, BUSY),
             Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         };
@@ -211,7 +211,7 @@ async fn scan(State(st): State<AppState>) -> Response {
         tokio::spawn(async move {
             // Run the scan in its own task so a panic is caught here and still
             // reported as "failed" instead of leaving `running` stuck on.
-            let outcome = tokio::spawn(run_web_scan(st.clone())).await;
+            let outcome = tokio::spawn(run_web_scan(st.clone(), lock.clone())).await;
             let (summary, error) = match outcome {
                 Ok(Ok(summary)) => (Some(summary), None),
                 Ok(Err(e)) => (None, Some(format!("{e:#}"))),
@@ -244,7 +244,14 @@ async fn scan_status(State(st): State<AppState>) -> Response {
 /// The web scan itself: fetch → store + prune → LLM re-score, updating
 /// `st.scan` as it goes. Custom pages are left out (the CLI scan handles
 /// those). Connections are short-lived and never held across an await.
-async fn run_web_scan(st: AppState) -> anyhow::Result<serde_json::Value> {
+async fn run_web_scan(st: AppState, lock: Arc<ScanLock>) -> anyhow::Result<serde_json::Value> {
+    // Mirror the phase into the lock file so the CLI digest can see it.
+    let phase = |p: &'static str| {
+        st.update_scan(|s| s.phase = Some(p));
+        lock.set_phase("web", p);
+    };
+    phase("fetching");
+
     // 1. Load profile + sources, then drop the connection before any await.
     let (model, sources) = {
         let conn = db::connect(&st.db_path)?;
@@ -264,7 +271,7 @@ async fn run_web_scan(st: AppState) -> anyhow::Result<serde_json::Value> {
 
     // 3. Store + prune with a fresh connection. Prune runs after store_all, so
     //    every job seen this scan just had its last_seen refreshed.
-    st.update_scan(|s| s.phase = Some("storing"));
+    phase("storing");
     let mut summary = {
         let conn = db::connect(&st.db_path)?;
         let mut summary = pipeline::store_all(&conn, &model, fetched)?;
@@ -273,7 +280,7 @@ async fn run_web_scan(st: AppState) -> anyhow::Result<serde_json::Value> {
     };
 
     // 4. LLM fit-scoring (skips cleanly when unconfigured).
-    st.update_scan(|s| s.phase = Some("ai scoring"));
+    phase("ai scoring");
     let cfg = profile::load_or_create(&st.profile_path).map(|p| llm::LlmConfig::from_profile(&p))?;
     let tally = match rescore_in_background(st.db_path.clone(), st.profile_path.clone(), st.client.clone()).await {
         Ok(t) => t,
@@ -327,11 +334,7 @@ async fn rescore_in_background(
     //    Send) and partial progress survives if the task is interrupted.
     for (i, (id, company, title, description)) in candidates.iter().enumerate() {
         if tally.should_stop() {
-            eprintln!(
-                "LLM circuit breaker: first {} calls failed — skipping the other {} job(s) this run.",
-                tally.failed,
-                candidates.len() - i
-            );
+            eprintln!("{} — skipping the other {} job(s) this run.", tally.stop_reason(), candidates.len() - i);
             break;
         }
         match llm::score_fit(&cfg, &client, &profile, title, company, description).await {
@@ -348,7 +351,11 @@ async fn rescore_in_background(
         }
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
     }
-    eprintln!("LLM re-scored {} job(s) ({} failed).", tally.scored, tally.failed);
+    tally.tokens_est = cfg.tokens_used();
+    eprintln!(
+        "LLM re-scored {} job(s) ({} failed), ~{} prompt tokens (estimate).",
+        tally.scored, tally.failed, tally.tokens_est
+    );
     // 3. Re-derive tiers from the fit scores once at the end.
     let conn = db::connect(db_path.as_str())?;
     db::rederive_llm_tiers(&conn)?;
