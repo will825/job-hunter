@@ -21,7 +21,9 @@ Runs 24/7 on a Raspberry Pi (systemd service + 7 AM digest cron); see `schedulin
    is running, re-run once more if another edit lands mid-rescore.
 3. **Prune** — `db::prune_stale` deletes untriaged jobs (`status IS NULL`) not seen in
    `STALE_DAYS` (14). Must run *after* store so live jobs have a fresh `last_seen`.
-4. **LLM re-rank** — Groq scores the top keyword survivors (`llm_score`, reasoning, gaps);
+4. **LLM re-rank** — `pipeline::rescore_llm_owned` (the one Send-safe path for CLI, digest, and
+   web) has Groq score `db::top_for_rescore` candidates (one per `title_key`, no dismissed/applied/
+   rejected, no onsite when hidden, recent first), 2 calls at a time (`llm_score`, reasoning, gaps);
    `db::rederive_llm_tiers` sets tiers from fit scores. Skipped cleanly with no `GROQ_API_KEY`.
    Retries are short (≤20s per wait, ≤60s per call). A 429 for the daily quota (Retry-After
    over 60s, or "per day" in the body) is `llm::QuotaExhausted`: no retries, breaker trips at

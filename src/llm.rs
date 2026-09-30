@@ -19,6 +19,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::db::RescoreCandidate;
 use crate::profile::Profile;
 
 /// Groq's OpenAI-compatible chat-completions endpoint.
@@ -163,30 +164,47 @@ pub async fn extract_profile(cfg: &LlmConfig, client: &reqwest::Client, resume_t
     Ok(extract)
 }
 
+/// Most of a job description sent for fit-scoring, in chars — keeps each call
+/// well under Groq free-tier per-minute token limits.
+const FIT_DESCRIPTION_CHARS: usize = 4000;
+
 /// Score how well one job fits the profile. Constrained to structured JSON.
+/// The prompt carries the job's work mode, location, and seniority plus the
+/// candidate's preferred work modes and regions, so the model can judge
+/// remote/location fit rather than just skills.
 pub async fn score_fit(
     cfg: &LlmConfig,
     client: &reqwest::Client,
     profile: &Profile,
-    title: &str,
-    company: &str,
-    description: &str,
+    job: &RescoreCandidate,
 ) -> Result<FitVerdict> {
     let system = "You are a precise job-fit evaluator. Given a candidate profile \
         and a job posting, judge how well the job fits THIS candidate. Return ONLY \
         JSON: {\"fit_score\": 0-100, \"tier\": \"apply_now|strong|maybe|skip\", \
         \"reasoning\": \"one sentence\", \"gaps\": [\"missing requirement\", ...]}. \
         Base the score on genuine fit to the candidate's target roles, skills, and \
-        preferences — not on how prestigious the company is.";
+        preferences — not on how prestigious the company is. Location matters: if \
+        the job is onsite-only (not remote or hybrid) and that is outside the \
+        candidate's preferred work modes or regions, fit_score must be at most 40. \
+        If the work mode is \"unknown\", judge it from the location and description.";
 
+    let or_any = |v: &[String]| if v.is_empty() { "any".to_string() } else { v.join(", ") };
     let user = format!(
-        "CANDIDATE PROFILE:\n{}\n\nTarget roles: {}\nStrong skills: {}\nPrefers: {}\n\n\
-         JOB:\nTitle: {title}\nCompany: {company}\nDescription:\n{}",
+        "CANDIDATE PROFILE:\n{}\n\nTarget roles: {}\nStrong skills: {}\n\
+         Preferred work modes: {}\nPreferred regions: {}\n\n\
+         JOB:\nTitle: {}\nCompany: {}\nWork mode: {}\nLocation: {}\nSeniority: {}\n\
+         Description:\n{}",
         profile.bio.trim(),
         profile.target_roles.join(", "),
         profile.skills.strong.join(", "),
-        profile.preferences.work_modes.join(", "),
-        truncate(description, 6000),
+        or_any(&profile.preferences.work_modes),
+        or_any(&profile.preferences.regions),
+        job.title,
+        job.company,
+        job.work_mode,
+        job.location,
+        job.seniority,
+        truncate(&job.description, FIT_DESCRIPTION_CHARS),
     );
 
     let value = groq_json(cfg, client, system, &user).await?;
@@ -364,16 +382,11 @@ pub fn snippet(s: &str, max: usize) -> String {
     s.trim().chars().take(max).collect()
 }
 
+/// The first `max` characters of `s` (by char, so it never splits UTF-8).
 fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        s
-    } else {
-        // Find a char boundary at/under max.
-        let mut end = max;
-        while !s.is_char_boundary(end) && end > 0 {
-            end -= 1;
-        }
-        &s[..end]
+    match s.char_indices().nth(max) {
+        Some((end, _)) => &s[..end],
+        None => s,
     }
 }
 
@@ -394,6 +407,13 @@ mod tests {
     fn snippet_caps_by_chars() {
         assert_eq!(snippet("  héllo world ", 5), "héllo");
         assert_eq!(snippet("short", 300), "short");
+    }
+
+    #[test]
+    fn truncate_caps_by_chars() {
+        assert_eq!(truncate("héllo", 2), "hé");
+        assert_eq!(truncate("héllo", 5), "héllo");
+        assert_eq!(truncate(&"é".repeat(5000), FIT_DESCRIPTION_CHARS).chars().count(), 4000);
     }
 
     #[test]

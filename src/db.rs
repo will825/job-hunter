@@ -612,16 +612,55 @@ pub fn baseline_notified(conn: &Connection) -> Result<usize> {
     Ok(n)
 }
 
-/// The top keyword-surviving jobs (tier above skip) that haven't been LLM-scored
-/// yet, best keyword score first — the candidates for Stage-2 fit-scoring.
-pub fn top_for_rescore(conn: &Connection, limit: i64) -> Result<Vec<(String, String, String, String)>> {
+/// A job to send to the LLM for Stage-2 fit-scoring.
+#[derive(Debug, Clone)]
+pub struct RescoreCandidate {
+    pub id: String,
+    pub company: String,
+    pub title: String,
+    pub description: String,
+    pub work_mode: String,
+    pub location: String,
+    pub seniority: String,
+}
+
+/// The candidates for Stage-2 fit-scoring: keyword survivors (tier above skip)
+/// not yet LLM-scored, skipping jobs you've dismissed/applied to/been rejected
+/// from and (with `hide_onsite`) onsite jobs. At most one job per normalized
+/// company + title (`title_key`), so a role listed in ten cities costs one call.
+/// Jobs first seen in the last 7 days come first, then best keyword score.
+pub fn top_for_rescore(conn: &Connection, limit: i64, hide_onsite: bool) -> Result<Vec<RescoreCandidate>> {
     let mut stmt = conn.prepare(
-        "SELECT id, company, title, description FROM jobs
-         WHERE tier != 'skip' AND llm_score IS NULL
-         ORDER BY keyword_score DESC LIMIT ?1",
+        "SELECT id, company, title, description, work_mode, location, seniority FROM (
+             SELECT id, company, title, description, work_mode, location, seniority,
+                    keyword_score,
+                    first_seen >= datetime('now', '-7 days') AS recent,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY COALESCE(title_key, id)
+                        ORDER BY first_seen >= datetime('now', '-7 days') DESC,
+                                 keyword_score DESC, id
+                    ) AS rn
+             FROM jobs
+             WHERE tier != 'skip' AND llm_score IS NULL
+               AND COALESCE(status, '') NOT IN ('dismissed', 'applied', 'rejected')
+               AND NOT (?2 AND work_mode = 'onsite')
+         )
+         WHERE rn = 1
+         ORDER BY recent DESC, keyword_score DESC, id
+         LIMIT ?1",
     )?;
     let rows = stmt
-        .query_map([limit], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .query_map(rusqlite::params![limit, hide_onsite], |r| {
+            Ok(RescoreCandidate {
+                id: r.get(0)?,
+                company: r.get(1)?,
+                title: r.get(2)?,
+                description: r.get(3)?,
+                work_mode: r.get(4)?,
+                location: r.get(5)?,
+                seniority: r.get(6)?,
+            })
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
@@ -931,6 +970,67 @@ mod tests {
         assert_eq!(count_jobs(&conn).unwrap(), 1, "second init must keep stored jobs");
         drop(conn);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A stored greenhouse job ready for LLM scoring (tier above skip).
+    fn candidate(conn: &Connection, company: &str, title: &str, location: &str, url: &str, score: i64) -> Job {
+        let mut j = Job::new(company, title, location, url, "greenhouse", "desc", None, "{}");
+        j.work_mode = "remote".into();
+        j.keyword_score = score;
+        j.tier = "strong".into();
+        upsert_job(conn, &j).unwrap();
+        j
+    }
+
+    #[test]
+    fn top_for_rescore_takes_one_job_per_company_and_title() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        // The same role at one company, listed in three cities (ATS rows don't merge).
+        for (i, city) in ["Louisville, KY", "Tampa, FL", "Remote, US"].iter().enumerate() {
+            candidate(&conn, "Humana", "Data Engineer", city, &format!("h{i}"), 50 + i as i64);
+        }
+        candidate(&conn, "Humana, Inc.", "Data  Engineer", "Denver, CO", "h9", 10);
+        candidate(&conn, "Splice", "Data Engineer", "Remote", "s1", 40);
+
+        let got = top_for_rescore(&conn, 30, false).unwrap();
+        let names: Vec<_> = got.iter().map(|c| (c.company.as_str(), c.location.as_str())).collect();
+        assert_eq!(names, [("Humana", "Remote, US"), ("Splice", "Remote")], "best-scoring copy wins");
+        assert_eq!(got[0].work_mode, "remote");
+    }
+
+    #[test]
+    fn top_for_rescore_skips_acted_on_scored_and_hidden_onsite_jobs() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let dismissed = candidate(&conn, "A", "Rust Engineer", "Remote", "a", 90);
+        set_job_status(&conn, &dismissed.id, Some("dismissed")).unwrap();
+        let applied = candidate(&conn, "B", "Rust Engineer", "Remote", "b", 90);
+        set_job_status(&conn, &applied.id, Some("applied")).unwrap();
+        let scored = candidate(&conn, "C", "Rust Engineer", "Remote", "c", 90);
+        set_llm_verdict(&conn, &scored.id, 70, "ok", "").unwrap();
+        let saved = candidate(&conn, "D", "Rust Engineer", "Remote", "d", 20);
+        set_job_status(&conn, &saved.id, Some("saved")).unwrap();
+        let mut onsite = Job::new("E", "Rust Engineer", "Austin, TX", "e", "greenhouse", "desc", None, "{}");
+        onsite.work_mode = "onsite".into();
+        onsite.keyword_score = 30;
+        onsite.tier = "strong".into();
+        upsert_job(&conn, &onsite).unwrap();
+
+        let ids = |hide| -> Vec<String> { top_for_rescore(&conn, 30, hide).unwrap().into_iter().map(|c| c.id).collect() };
+        assert_eq!(ids(false), [onsite.id, saved.id.clone()]);
+        assert_eq!(ids(true), [saved.id], "onsite hidden when onsite_mode = hide");
+    }
+
+    #[test]
+    fn top_for_rescore_prefers_recent_jobs() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let old = candidate(&conn, "Old", "Rust Engineer", "Remote", "o", 90);
+        conn.execute("UPDATE jobs SET first_seen = datetime('now', '-10 days') WHERE id = ?1", [&old.id]).unwrap();
+        let new = candidate(&conn, "New", "Rust Engineer", "Remote", "n", 40);
+        let ids: Vec<_> = top_for_rescore(&conn, 30, false).unwrap().into_iter().map(|c| c.id).collect();
+        assert_eq!(ids, [new.id, old.id]);
     }
 
     #[test]

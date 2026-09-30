@@ -124,7 +124,7 @@ async fn cmd_scan(client: &reqwest::Client) -> Result<()> {
     }
 
     println!("Scanning...\n");
-    let summary = pipeline::full_scan(&conn, client, &profile, |line| println!("  {line}")).await?;
+    let summary = pipeline::full_scan(&conn, DB_PATH, client, &profile, |line| println!("  {line}")).await?;
     record_last_run(&conn, "scan", &summary);
 
     println!("\nSummary");
@@ -190,7 +190,7 @@ async fn cmd_digest(client: &reqwest::Client) -> Result<()> {
     let (summary, from_db_only) = match lock {
         scan_lock::Acquired::Lock(_lock) => {
             println!("Daily digest: scanning…");
-            let summary = pipeline::full_scan(&conn, client, &profile, |line| println!("  {line}")).await?;
+            let summary = pipeline::full_scan(&conn, DB_PATH, client, &profile, |line| println!("  {line}")).await?;
             record_last_run(&conn, "digest", &summary);
             (summary, false)
         }

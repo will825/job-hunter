@@ -6,9 +6,11 @@
 //! is what lets the web handler stay `Send`; it's also just cleaner.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
+use futures::stream::{self, StreamExt};
 use rusqlite::Connection;
 
 use crate::classify;
@@ -260,53 +262,86 @@ pub fn store_all(conn: &Connection, model: &ScoringModel, fetched: Vec<BoardFetc
     Ok(s)
 }
 
-/// Stage-2 LLM re-ranking: for the top keyword survivors, ask the LLM to judge
-/// genuine fit and let its verdict override the tier. Skips cleanly (empty
-/// tally) when the LLM isn't ready. Logs the run's first LLM error in full and
-/// stops early if the first calls all fail (see [`LlmTally`]).
-pub async fn rescore_llm(
-    conn: &Connection,
-    client: &reqwest::Client,
-    cfg: &LlmConfig,
+/// How many LLM fit-scoring calls run at once. Two keeps a run quick without
+/// tripping Groq's per-minute limits (429s back off inside `llm::groq_json`).
+const LLM_CONCURRENCY: usize = 2;
+
+/// Stage-2 LLM re-ranking: for the top keyword survivors (see
+/// [`db::top_for_rescore`]), ask the LLM to judge genuine fit and let its
+/// verdict override the tier. Skips cleanly (empty tally) when the LLM isn't
+/// ready. Logs the run's first LLM error in full and stops early if the first
+/// calls all fail (see [`LlmTally`]).
+///
+/// Opens short-lived connections to `db_path` and never holds one across an
+/// await, so the future is `Send` (when `progress` is) and the web server can
+/// spawn it. Shared by the CLI scan, the digest, and the web scan.
+pub async fn rescore_llm_owned(
+    db_path: &str,
     profile: &Profile,
+    client: &reqwest::Client,
     mut progress: impl FnMut(&str),
 ) -> Result<LlmTally> {
     let mut tally = LlmTally::default();
+    let cfg = LlmConfig::from_profile(profile);
     if !cfg.is_ready() {
         return Ok(tally);
     }
-    // Read the candidates (sync), then release the borrow before any await.
-    let candidates = db::top_for_rescore(conn, cfg.max_jobs_per_run)?;
+    let hide_onsite = profile.compile().hide_onsite;
+    let candidates = {
+        let conn = db::connect(db_path)?;
+        db::top_for_rescore(&conn, cfg.max_jobs_per_run, hide_onsite)?
+    };
     if candidates.is_empty() {
         return Ok(tally);
     }
 
-    for (i, (id, company, title, description)) in candidates.iter().enumerate() {
-        if tally.should_stop() {
-            progress(&format!("  {} — skipping the other {} job(s) this run.", tally.stop_reason(), candidates.len() - i));
-            break;
-        }
-        match llm::score_fit(cfg, client, profile, title, company, description).await {
-            Ok(v) => {
+    // Calls run LLM_CONCURRENCY at a time. Once the breaker opens, calls not yet
+    // started see `stop` and are skipped instead of sent.
+    let stop = AtomicBool::new(false);
+    let mut skipped = 0usize;
+    let mut results = stream::iter(candidates)
+        .map(|job| {
+            let (cfg, stop) = (&cfg, &stop);
+            async move {
+                if stop.load(Ordering::Relaxed) {
+                    return (job, None);
+                }
+                let verdict = llm::score_fit(cfg, client, profile, &job).await;
+                (job, Some(verdict))
+            }
+        })
+        .buffer_unordered(LLM_CONCURRENCY);
+
+    while let Some((job, result)) = results.next().await {
+        match result {
+            None => skipped += 1,
+            Some(Ok(v)) => {
                 // Persist each verdict as it's computed, so an interrupted run
-                // (timeout, reboot, rate-limit abort) keeps the work already done
-                // instead of discarding the whole batch.
-                db::set_llm_verdict(conn, id, v.fit_score, &v.reasoning, &v.gaps.join("; "))?;
+                // (timeout, reboot, rate-limit abort) keeps the work already done.
+                let conn = db::connect(db_path)?;
+                db::set_llm_verdict(&conn, &job.id, v.fit_score, &v.reasoning, &v.gaps.join("; "))?;
                 tally.ok();
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 if tally.fail(&e) {
-                    progress(&format!("  LLM error (first this run) on {title}: {e:#}"));
+                    progress(&format!("  LLM error (first this run) on {}: {e:#}", job.title));
                 } else {
-                    progress(&format!("  (llm skipped {title}: {e})"));
+                    progress(&format!("  (llm skipped {}: {e})", job.title));
                 }
             }
         }
-        tokio::time::sleep(Duration::from_millis(120)).await; // gentle on the API
+        if tally.should_stop() {
+            stop.store(true, Ordering::Relaxed);
+        }
+    }
+    drop(results);
+    if skipped > 0 {
+        progress(&format!("  {} — skipped the other {skipped} job(s) this run.", tally.stop_reason()));
     }
 
     // Tiers are derived from the fit scores, not the LLM's tier label.
-    db::rederive_llm_tiers(conn, profile.compile().hide_onsite)?;
+    let conn = db::connect(db_path)?;
+    db::rederive_llm_tiers(&conn, hide_onsite)?;
     tally.tokens_est = cfg.tokens_used();
     progress(&format!("  LLM used ~{} prompt tokens this run (estimate).", tally.tokens_est));
     Ok(tally)
@@ -359,6 +394,7 @@ pub const STALE_DAYS: i64 = 14;
 /// daily `digest`. Holds the DB connection across awaits (fine for the CLI).
 pub async fn full_scan(
     conn: &Connection,
+    db_path: &str,
     client: &reqwest::Client,
     profile: &Profile,
     mut progress: impl FnMut(&str),
@@ -388,7 +424,7 @@ pub async fn full_scan(
     let mut tally = LlmTally::default();
     if cfg.is_ready() {
         progress(&format!("LLM fit-scoring top matches ({})…", cfg.model));
-        tally = rescore_llm(conn, client, &cfg, profile, &mut progress).await?;
+        tally = rescore_llm_owned(db_path, profile, client, &mut progress).await?;
         progress(&format!("Re-scored {} job(s) with the LLM ({} failed).", tally.scored, tally.failed));
     } else {
         progress(&format!("(LLM off: {} — keyword scoring only)", cfg.why_not_ready()));

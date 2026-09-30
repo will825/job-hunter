@@ -25,3 +25,5 @@ anyhow = "1"
 toml = "0.8"
 # Format-preserving TOML edits (so editing the profile from the UI keeps comments)
 toml_edit = "0.22"
+# Bounded concurrency for LLM calls (stream::buffer_unordered)
+futures = "0.3"

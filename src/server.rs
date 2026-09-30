@@ -309,8 +309,9 @@ async fn run_web_scan(st: AppState, lock: Arc<ScanLock>) -> anyhow::Result<serde
 
     // 4. LLM fit-scoring (skips cleanly when unconfigured).
     phase("ai scoring");
-    let cfg = profile::load_or_create(&st.profile_path).map(|p| llm::LlmConfig::from_profile(&p))?;
-    let tally = match rescore_in_background(st.db_path.clone(), st.profile_path.clone(), st.client.clone()).await {
+    let profile = profile::load_or_create(&st.profile_path)?;
+    let cfg = llm::LlmConfig::from_profile(&profile);
+    let tally = match pipeline::rescore_llm_owned(&st.db_path, &profile, &st.client, |line| eprintln!("{line}")).await {
         Ok(t) => t,
         Err(e) => {
             eprintln!("background rescore failed: {e:#}");
@@ -432,63 +433,6 @@ async fn rescore_stored(st: &AppState) -> anyhow::Result<pipeline::RescoreSummar
         pipeline::rescore_all(&conn, &model)
     })
     .await?
-}
-
-/// LLM re-scoring step of the web "Scan now". Opens its own short-lived
-/// connections and never holds one across an await, so the future is `Send` and
-/// can be spawned. Scores the top keyword survivors, writes verdicts, and
-/// re-derives tiers from the fit scores (mirrors `pipeline::rescore_llm`,
-/// including the first-error log and circuit breaker).
-async fn rescore_in_background(
-    db_path: Arc<String>,
-    profile_path: Arc<String>,
-    client: reqwest::Client,
-) -> anyhow::Result<pipeline::LlmTally> {
-    let mut tally = pipeline::LlmTally::default();
-    let profile = profile::load_or_create(profile_path.as_str())?;
-    let cfg = llm::LlmConfig::from_profile(&profile);
-    if !cfg.is_ready() {
-        return Ok(tally);
-    }
-    // 1. Read candidates, then drop the connection before any await.
-    let candidates = {
-        let conn = db::connect(db_path.as_str())?;
-        db::top_for_rescore(&conn, cfg.max_jobs_per_run)?
-    };
-    if candidates.is_empty() {
-        return Ok(tally);
-    }
-    // 2. Score and persist each verdict as we go. A short-lived connection per
-    //    write means no connection is held across an await (keeps the future
-    //    Send) and partial progress survives if the task is interrupted.
-    for (i, (id, company, title, description)) in candidates.iter().enumerate() {
-        if tally.should_stop() {
-            eprintln!("{} — skipping the other {} job(s) this run.", tally.stop_reason(), candidates.len() - i);
-            break;
-        }
-        match llm::score_fit(&cfg, &client, &profile, title, company, description).await {
-            Ok(v) => {
-                let conn = db::connect(db_path.as_str())?;
-                db::set_llm_verdict(&conn, id, v.fit_score, &v.reasoning, &v.gaps.join("; "))?;
-                tally.ok();
-            }
-            Err(e) => {
-                if tally.fail(&e) {
-                    eprintln!("LLM error (first this run) on {title}: {e:#}");
-                }
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-    }
-    tally.tokens_est = cfg.tokens_used();
-    eprintln!(
-        "LLM re-scored {} job(s) ({} failed), ~{} prompt tokens (estimate).",
-        tally.scored, tally.failed, tally.tokens_est
-    );
-    // 3. Re-derive tiers from the fit scores once at the end.
-    let conn = db::connect(db_path.as_str())?;
-    db::rederive_llm_tiers(&conn, profile.compile().hide_onsite)?;
-    Ok(tally)
 }
 
 async fn jobs(State(st): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Response {
