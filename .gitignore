@@ -32,3 +32,5 @@ node_modules/
 
 # Local backups of private files (profile.toml, jobs.db)
 /backups/
+profile.toml.bak*
+jobs.db.bak*

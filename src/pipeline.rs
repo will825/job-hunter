@@ -325,7 +325,7 @@ pub fn enrich(job: &mut Job, model: &ScoringModel) {
 
 /// What a [`rescore_all`] changed: tier counts across the whole DB before and
 /// after, and how many jobs were re-scored.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RescoreSummary {
     pub jobs: usize,
     pub before: BTreeMap<String, i64>,

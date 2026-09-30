@@ -15,8 +15,10 @@ Runs 24/7 on a Raspberry Pi (systemd service + 7 AM digest cron); see `schedulin
    the last 30 days) merge into one row, appending to `locations` (JSON array). ATS rows never
    merge across locations. `job_hunter dedupe` collapses older per-city duplicates.
    `job_hunter rescore` / `POST /api/rescore` (`pipeline::rescore_all`) re-run enrich on every
-   stored job with the current profile in one transaction, then `rederive_llm_tiers`. The web UI
-   runs it automatically after profile edits (roles/skills/interests, resume upload).
+   stored job with the current profile in one transaction, then `rederive_llm_tiers`. Profile edits
+   in the web UI (roles/skills/interests, resume upload) return at once and re-score in the
+   background under the scan lock (phase "re-scoring" in `/api/scan/status`); skipped if a scan
+   is running, re-run once more if another edit lands mid-rescore.
 3. **Prune** — `db::prune_stale` deletes untriaged jobs (`status IS NULL`) not seen in
    `STALE_DAYS` (14). Must run *after* store so live jobs have a fresh `last_seen`.
 4. **LLM re-rank** — Groq scores the top keyword survivors (`llm_score`, reasoning, gaps);

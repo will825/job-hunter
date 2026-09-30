@@ -44,12 +44,19 @@ struct ScanStatus {
     running: bool,
     /// Unix seconds.
     started_at: Option<u64>,
-    /// "fetching" | "storing" | "ai scoring" | "done" | "failed"
+    /// "fetching" | "storing" | "ai scoring" | "done" | "failed", or for a
+    /// re-score after a profile edit: "re-scoring" | "rescored" | "failed".
     phase: Option<&'static str>,
     boards_done: usize,
     boards_total: usize,
     last_summary: Option<serde_json::Value>,
+    /// Tier counts from the most recent re-score.
+    last_rescore: Option<pipeline::RescoreSummary>,
     error: Option<String>,
+    /// A profile edit arrived while re-scoring: go again when this pass ends,
+    /// so the latest profile is the one applied.
+    #[serde(skip)]
+    rescore_again: bool,
 }
 
 impl AppState {
@@ -187,28 +194,11 @@ async fn delete_company(State(st): State<AppState>, Path(id): Path<i64>) -> Resp
 /// away. The UI polls `/api/scan/status` for progress. 409 if a scan (web or
 /// CLI) is already running.
 async fn scan(State(st): State<AppState>) -> Response {
-    const BUSY: &str = "A scan is already running";
-    // Claim the in-process slot first (cheap, and closes the double-click race),
-    // then the cross-process lock shared with the CLI scan/digest.
     {
-        let mut status = st.scan.lock().unwrap_or_else(|e| e.into_inner());
-        if status.running {
-            return err(StatusCode::CONFLICT, BUSY);
-        }
-        let lock = match ScanLock::try_acquire(st.lock_path.as_str()) {
-            Ok(Some(lock)) => Arc::new(lock),
-            Ok(None) => return err(StatusCode::CONFLICT, BUSY),
-            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        let lock = match claim_scan_or_busy(&st, "fetching") {
+            Ok(lock) => lock,
+            Err(resp) => return *resp,
         };
-        *status = ScanStatus {
-            running: true,
-            started_at: Some(unix_now()),
-            phase: Some("fetching"),
-            last_summary: status.last_summary.take(),
-            ..Default::default()
-        };
-        drop(status);
-
         let st = st.clone();
         tokio::spawn(async move {
             // Run the scan in its own task so a panic is caught here and still
@@ -229,12 +219,45 @@ async fn scan(State(st): State<AppState>) -> Response {
                     s.last_summary = summary;
                 }
                 s.error = error;
+                // Release the file lock while still holding the status mutex,
+                // so a follow-up claim never sees "not running" but a held lock.
+                drop(lock);
             });
-            drop(lock);
         });
     }
 
     (StatusCode::ACCEPTED, Json(json!({ "ok": true }))).into_response()
+}
+
+/// Claim the scan slot for `phase`: the in-process status first (cheap, and
+/// closes the double-click race), then the cross-process lock shared with the
+/// CLI scan/digest. `Ok(None)` means a scan (web or CLI) already holds it.
+fn claim_scan(st: &AppState, phase: &'static str) -> anyhow::Result<Option<Arc<ScanLock>>> {
+    let mut status = st.scan.lock().unwrap_or_else(|e| e.into_inner());
+    if status.running {
+        return Ok(None);
+    }
+    let Some(lock) = ScanLock::try_acquire(st.lock_path.as_str())? else { return Ok(None) };
+    let lock = Arc::new(lock);
+    lock.set_phase("web", phase);
+    *status = ScanStatus {
+        running: true,
+        started_at: Some(unix_now()),
+        phase: Some(phase),
+        last_summary: status.last_summary.take(),
+        last_rescore: status.last_rescore.take(),
+        ..Default::default()
+    };
+    Ok(Some(lock))
+}
+
+/// [`claim_scan`] for a handler: the lock, or the 409/500 response to return.
+fn claim_scan_or_busy(st: &AppState, phase: &'static str) -> Result<Arc<ScanLock>, Box<Response>> {
+    match claim_scan(st, phase) {
+        Ok(Some(lock)) => Ok(lock),
+        Ok(None) => Err(Box::new(err(StatusCode::CONFLICT, "A scan is already running"))),
+        Err(e) => Err(Box::new(err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))),
+    }
 }
 
 /// `GET /api/scan/status`: the current/last web scan's progress.
@@ -311,11 +334,90 @@ fn unix_now() -> u64 {
 }
 
 /// `POST /api/rescore`: re-score every stored job against the current profile
-/// and return the before/after tier counts.
+/// and return the before/after tier counts. Takes the scan slot like a scan
+/// does (409 if one is running) and reports "re-scoring" in the scan status.
 async fn rescore(State(st): State<AppState>) -> Response {
-    match rescore_stored(&st).await {
+    let lock = match claim_scan_or_busy(&st, "re-scoring") {
+        Ok(lock) => lock,
+        Err(resp) => return *resp,
+    };
+    match run_rescores(&st, lock).await {
         Ok(summary) => Json(summary).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
+}
+
+/// After a profile edit, re-score stored jobs in the background so the edit
+/// returns at once and the UI shows "Re-scoring…" via the scan status. If a
+/// re-score is already running it's told to go again (so the newest edit
+/// wins); if a scan holds the slot, it's skipped. Returns whether a re-score
+/// is running for this edit.
+fn start_background_rescore(st: &AppState) -> bool {
+    {
+        let mut status = st.scan.lock().unwrap_or_else(|e| e.into_inner());
+        if status.running {
+            if status.phase == Some("re-scoring") {
+                status.rescore_again = true;
+                return true;
+            }
+            return false;
+        }
+    }
+    let lock = match claim_scan(st, "re-scoring") {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return false,
+        Err(e) => {
+            eprintln!("couldn't start rescore after profile edit: {e:#}");
+            return false;
+        }
+    };
+    let st = st.clone();
+    tokio::spawn(async move {
+        if let Err(e) = run_rescores(&st, lock).await {
+            eprintln!("background rescore failed: {e:#}");
+        }
+    });
+    true
+}
+
+/// Re-score while holding the scan slot, going again whenever a profile edit
+/// asked to (`rescore_again`), then release it. The summary spans every pass:
+/// tier counts before the first and after the last. Always leaves the status
+/// not-running, even on error (a panic in the blocking pass comes back as Err).
+async fn run_rescores(st: &AppState, lock: Arc<ScanLock>) -> anyhow::Result<pipeline::RescoreSummary> {
+    let mut before = None;
+    loop {
+        match rescore_stored(st).await {
+            Ok(mut summary) => {
+                if let Some(b) = before.take() {
+                    summary.before = b;
+                }
+                // Decide under the same mutex edits set the flag with, so
+                // none is lost between this check and releasing the slot.
+                let mut status = st.scan.lock().unwrap_or_else(|e| e.into_inner());
+                if std::mem::take(&mut status.rescore_again) {
+                    before = Some(summary.before);
+                    continue;
+                }
+                status.running = false;
+                status.phase = Some("rescored");
+                status.last_rescore = Some(summary.clone());
+                // Release the file lock before the status mutex, so anyone who
+                // sees running = false can also take the lock.
+                drop(lock);
+                break Ok(summary);
+            }
+            Err(e) => {
+                st.update_scan(|s| {
+                    s.running = false;
+                    s.rescore_again = false;
+                    s.phase = Some("failed");
+                    s.error = Some(format!("Re-score failed: {e:#}"));
+                    drop(lock);
+                });
+                break Err(e);
+            }
+        }
     }
 }
 
@@ -330,18 +432,6 @@ async fn rescore_stored(st: &AppState) -> anyhow::Result<pipeline::RescoreSummar
         pipeline::rescore_all(&conn, &model)
     })
     .await?
-}
-
-/// After a profile edit, re-score stored jobs so the change shows right away.
-/// The edit itself already succeeded, so a failure here is logged, not returned.
-async fn rescore_after_profile_edit(st: &AppState) -> Option<pipeline::RescoreSummary> {
-    match rescore_stored(st).await {
-        Ok(summary) => Some(summary),
-        Err(e) => {
-            eprintln!("rescore after profile edit failed: {e:#}");
-            None
-        }
-    }
 }
 
 /// LLM re-scoring step of the web "Scan now". Opens its own short-lived
@@ -565,8 +655,8 @@ async fn edit_profile_list(State(st): State<AppState>, Json(req): Json<ListEdit>
     if let Err(e) = profile::edit_list(&st.profile_path, &req.field, &req.value, req.remove) {
         return err(StatusCode::BAD_REQUEST, e.to_string());
     }
-    let rescore = rescore_after_profile_edit(&st).await;
-    Json(json!({ "ok": true, "rescore": rescore })).into_response()
+    let rescoring = start_background_rescore(&st);
+    Json(json!({ "ok": true, "rescoring": rescoring })).into_response()
 }
 
 /// Upload a resume (PDF or .txt); extract text, have the LLM turn it into a
@@ -648,11 +738,8 @@ async fn upload_resume(State(st): State<AppState>, mut multipart: Multipart) -> 
     if !failed.is_empty() {
         message.push_str(&format!(" (Skipped {}: couldn't read.)", failed.len()));
     }
-    let rescore = rescore_after_profile_edit(&st).await;
-    if let Some(r) = &rescore {
-        message.push_str(&format!(" Re-scored {} job(s).", r.jobs));
-    }
-    Json(json!({ "ok": true, "message": message, "rescore": rescore })).into_response()
+    let rescoring = start_background_rescore(&st);
+    Json(json!({ "ok": true, "message": message, "rescoring": rescoring })).into_response()
 }
 
 /// Extract plain text from an uploaded resume. Handles PDF (default) and .txt.

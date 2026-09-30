@@ -389,10 +389,10 @@ async function scan(){
   setScanBusy(false);
 }
 
-function setScanBusy(busy, text){
+function setScanBusy(busy, text, label){
   const btn = $('scanBtn');
   btn.disabled = busy;
-  if(busy){ btn.innerHTML = '<span class="spin"></span> Scanning…'; if(text) $('scanMsg').textContent = text; }
+  if(busy){ btn.innerHTML = `<span class="spin"></span> ${label||'Scanning…'}`; if(text) $('scanMsg').textContent = text; }
   else btn.textContent = 'Scan now';
 }
 
@@ -407,6 +407,7 @@ async function pollScan(){
   try{ s = await (await fetch('/api/scan/status')).json(); }catch(e){ return; } // transient; try again next tick
   const msg = $('scanMsg');
   if(s.running){
+    if(s.phase === 're-scoring'){ setScanBusy(true, 'Re-scoring jobs with your updated profile…', 'Re-scoring…'); return; }
     setScanBusy(true);
     if(s.phase === 'fetching') msg.textContent = s.boards_total ? `Fetching ${s.boards_done}/${s.boards_total} boards…` : 'Fetching boards…';
     else if(s.phase === 'storing') msg.textContent = 'Saving jobs…';
@@ -415,7 +416,12 @@ async function pollScan(){
   }
   clearInterval(scanPoll); scanPoll = null;
   setScanBusy(false);
-  if(s.phase === 'failed'){ msg.textContent = 'Scan failed: ' + (s.error || 'unknown error'); return; }
+  if(s.phase === 'failed'){ msg.textContent = (s.error && s.error.startsWith('Re-score') ? '' : 'Scan failed: ') + (s.error || 'unknown error'); return; }
+  if(s.phase === 'rescored'){
+    const r = s.last_rescore || {}, a = r.after || {};
+    msg.textContent = `Re-scored ${r.jobs||0} jobs — ${a.apply_now||0} apply now, ${a.strong||0} strong.`;
+    reloadCurrentView(); return;
+  }
   const d = s.last_summary;
   if(d){
     const removed = d.pruned ? `, ${d.pruned} expired removed` : '';
@@ -786,7 +792,7 @@ async function uploadResume(){
   try{
     const r = await fetch('/api/profile/resume',{method:'POST',body:fd});
     const d = await r.json();
-    if(r.ok){ msg.className='msg ok'; msg.textContent = d.message || 'Done.'; loadProfile(); }
+    if(r.ok){ msg.className='msg ok'; msg.textContent = d.message || 'Done.'; loadProfile(); if(d.rescoring) watchScan(); }
     else { msg.className='msg err'; msg.textContent = d.error || 'Could not read that file.'; }
   }catch(e){ msg.className='msg err'; msg.textContent = 'Upload error.'; }
   btn.disabled = false; btn.textContent = 'Upload';
@@ -794,13 +800,18 @@ async function uploadResume(){
 
 async function addP(field, inputId){
   const el = $(inputId); const value = el.value.trim(); if(!value) return;
-  await fetch('/api/profile/list',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({field,value})});
-  el.value=''; loadProfile();
+  const r = await fetch('/api/profile/list',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({field,value})});
+  el.value=''; loadProfile(); followRescore(r);
 }
 async function delP(field, encValue){
   const value = decodeURIComponent(encValue);
-  await fetch('/api/profile/list',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({field,value,remove:true})});
-  loadProfile();
+  const r = await fetch('/api/profile/list',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({field,value,remove:true})});
+  loadProfile(); followRescore(r);
+}
+// Profile edits re-score stored jobs in the background; show it in the scan status.
+async function followRescore(r){
+  const d = await r.json().catch(()=>({}));
+  if(d.rescoring) watchScan();
 }
 
 let currentView = 'home';
