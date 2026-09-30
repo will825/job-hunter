@@ -676,6 +676,23 @@ pub fn set_llm_verdict(conn: &Connection, id: &str, fit_score: i64, reasoning: &
     Ok(())
 }
 
+/// Copy job `id`'s LLM verdict to its unscored twins: other rows with the same
+/// `title_key` (normalized company + title, e.g. one role listed per city) AND
+/// the same `work_mode` — a remote and an onsite posting of one title can
+/// deserve different scores. Returns how many rows were updated.
+pub fn copy_llm_verdict_to_twins(conn: &Connection, id: &str) -> Result<usize> {
+    let n = conn.execute(
+        "UPDATE jobs SET (llm_score, llm_reasoning, llm_gaps) =
+             (SELECT llm_score, llm_reasoning, llm_gaps FROM jobs WHERE id = ?1)
+         WHERE llm_score IS NULL AND id != ?1
+           AND (title_key, work_mode) =
+               (SELECT title_key, work_mode FROM jobs
+                WHERE id = ?1 AND llm_score IS NOT NULL AND title_key IS NOT NULL)",
+        [id],
+    )?;
+    Ok(n)
+}
+
 /// Recompute tier from the LLM fit score for every AI-reviewed job. This is the
 /// single place tiering happens once a job has been scored — so tiers always
 /// reflect the real fit, not the LLM's inconsistent tier label. Thresholds are
@@ -1020,6 +1037,35 @@ mod tests {
         let ids = |hide| -> Vec<String> { top_for_rescore(&conn, 30, hide).unwrap().into_iter().map(|c| c.id).collect() };
         assert_eq!(ids(false), [onsite.id, saved.id.clone()]);
         assert_eq!(ids(true), [saved.id], "onsite hidden when onsite_mode = hide");
+    }
+
+    #[test]
+    fn verdict_copies_to_same_title_and_work_mode_only() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let judged = candidate(&conn, "Humana", "Data Engineer", "Louisville, KY", "h1", 50);
+        let twin = candidate(&conn, "Humana, Inc.", "Data Engineer", "Tampa, FL", "h2", 40);
+        let mut onsite = Job::new("Humana", "Data Engineer", "Denver, CO", "h3", "greenhouse", "desc", None, "{}");
+        onsite.work_mode = "onsite".into();
+        onsite.tier = "strong".into();
+        upsert_job(&conn, &onsite).unwrap();
+        let other_title = candidate(&conn, "Humana", "Data Analyst", "Remote", "h4", 40);
+        let already = candidate(&conn, "Humana", "Data Engineer", "Austin, TX", "h5", 40);
+        set_llm_verdict(&conn, &already.id, 30, "own verdict", "").unwrap();
+
+        set_llm_verdict(&conn, &judged.id, 85, "great fit", "k8s").unwrap();
+        assert_eq!(copy_llm_verdict_to_twins(&conn, &judged.id).unwrap(), 1);
+
+        let verdict = |id: &str| -> (Option<i64>, Option<String>, Option<String>) {
+            conn.query_row("SELECT llm_score, llm_reasoning, llm_gaps FROM jobs WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap()
+        };
+        assert_eq!(verdict(&twin.id), (Some(85), Some("great fit".into()), Some("k8s".into())));
+        assert_eq!(verdict(&onsite.id).0, None, "different work_mode keeps its own score");
+        assert_eq!(verdict(&other_title.id).0, None);
+        assert_eq!(verdict(&already.id).0, Some(30), "existing verdicts aren't overwritten");
     }
 
     #[test]

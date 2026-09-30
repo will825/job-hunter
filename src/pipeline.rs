@@ -320,6 +320,8 @@ pub async fn rescore_llm_owned(
                 // (timeout, reboot, rate-limit abort) keeps the work already done.
                 let conn = db::connect(db_path)?;
                 db::set_llm_verdict(&conn, &job.id, v.fit_score, &v.reasoning, &v.gaps.join("; "))?;
+                // The same role listed elsewhere with the same work mode shares it.
+                db::copy_llm_verdict_to_twins(&conn, &job.id)?;
                 tally.ok();
             }
             Some(Err(e)) => {
