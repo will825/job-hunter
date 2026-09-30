@@ -137,7 +137,7 @@ fn backfill_title_keys(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn init_schema(conn: &Connection) -> Result<()> {
+pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS jobs (
@@ -688,6 +688,53 @@ pub fn source_stats(conn: &Connection, limit: i64) -> Result<Vec<(String, i64, i
 pub fn count_tier(conn: &Connection, tier: &str) -> Result<i64> {
     let n = conn.query_row("SELECT COUNT(*) FROM jobs WHERE tier = ?1", [tier], |r| r.get(0))?;
     Ok(n)
+}
+
+/// Job count per tier across the whole DB (tier → count). Ordered so the
+/// before/after summaries of a rescore line up.
+pub fn tier_counts(conn: &Connection) -> Result<std::collections::BTreeMap<String, i64>> {
+    let mut stmt = conn.prepare("SELECT tier, COUNT(*) FROM jobs GROUP BY tier")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+/// Every stored job rebuilt as a [`Job`] from its stored fields, for
+/// re-running classification + keyword scoring without a re-fetch. The stored
+/// `id` is kept (not recomputed), so updates hit the right row.
+pub fn stored_jobs(conn: &Connection) -> Result<Vec<Job>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, company, title, location, url, source, description, posted_date, raw_json FROM jobs",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            let mut job = Job::new(
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, String>(8)?,
+            );
+            job.id = r.get(0)?;
+            Ok(job)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Write a job's classification + keyword score + tier back to its row.
+/// Touches nothing else (not `last_seen`, status, or the LLM verdict).
+pub fn set_enrichment(conn: &Connection, job: &Job) -> Result<()> {
+    conn.execute(
+        "UPDATE jobs SET work_mode = ?2, region = ?3, seniority = ?4, keyword_score = ?5, tier = ?6
+         WHERE id = ?1",
+        rusqlite::params![job.id, job.work_mode, job.region, job.seniority, job.keyword_score, job.tier],
+    )?;
+    Ok(())
 }
 
 /// A job row for display in the web UI / results view.

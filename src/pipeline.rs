@@ -5,6 +5,7 @@
 //! phase (DB, no network). Keeping the SQLite connection out of any `.await`
 //! is what lets the web handler stay `Send`; it's also just cleaner.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -322,6 +323,34 @@ pub fn enrich(job: &mut Job, model: &ScoringModel) {
     job.tier = score::job_tier(job, job.keyword_score, model).as_str().to_string();
 }
 
+/// What a [`rescore_all`] changed: tier counts across the whole DB before and
+/// after, and how many jobs were re-scored.
+#[derive(Debug, serde::Serialize)]
+pub struct RescoreSummary {
+    pub jobs: usize,
+    pub before: BTreeMap<String, i64>,
+    pub after: BTreeMap<String, i64>,
+}
+
+/// Re-run [`enrich`] on every stored job against `model` (the current
+/// profile), using each job's stored title/description/location/raw_json — so
+/// a profile change applies without waiting for boards to be re-fetched. One
+/// transaction. Jobs with an LLM verdict then get their tier back from the fit
+/// score via [`db::rederive_llm_tiers`].
+pub fn rescore_all(conn: &Connection, model: &ScoringModel) -> Result<RescoreSummary> {
+    let tx = conn.unchecked_transaction()?;
+    let before = db::tier_counts(&tx)?;
+    let mut jobs = db::stored_jobs(&tx)?;
+    for job in &mut jobs {
+        enrich(job, model);
+        db::set_enrichment(&tx, job)?;
+    }
+    db::rederive_llm_tiers(&tx, model.hide_onsite)?;
+    let after = db::tier_counts(&tx)?;
+    tx.commit()?;
+    Ok(RescoreSummary { jobs: jobs.len(), before, after })
+}
+
 /// How long a posting can go unseen by scans before it's pruned as expired.
 pub const STALE_DAYS: i64 = 14;
 
@@ -477,5 +506,37 @@ mod tests {
         s.set_llm(&cfg(false, None), &LlmTally::default());
         assert!(!s.llm_failed_run());
         assert!(s.llm_error.is_none());
+    }
+
+    #[test]
+    fn rescore_all_applies_the_current_profile_and_keeps_llm_tiers() {
+        let conn = Connection::open_in_memory().unwrap();
+        db::init_schema(&conn).unwrap();
+        let mut rust = Job::new("Co", "Rust Engineer", "Remote", "u1", "greenhouse", "rust", None, "{}");
+        let mut judged = Job::new("Co", "Rust Developer", "Remote", "u2", "greenhouse", "rust", None, "{}");
+        // Stored under a profile that didn't care about Rust.
+        let old = Profile::default().compile();
+        enrich(&mut rust, &old);
+        enrich(&mut judged, &old);
+        assert_eq!(rust.tier, "skip");
+        db::upsert_job(&conn, &rust).unwrap();
+        db::upsert_job(&conn, &judged).unwrap();
+        db::set_llm_verdict(&conn, &judged.id, 50, "ok", "").unwrap();
+        db::rederive_llm_tiers(&conn, false).unwrap();
+
+        let mut profile = Profile::default();
+        profile.target_roles = vec!["Rust Engineer".into(), "Rust Developer".into()];
+        let s = rescore_all(&conn, &profile.compile()).unwrap();
+
+        let tier = |id: &str| -> String {
+            conn.query_row("SELECT tier FROM jobs WHERE id = ?1", [id], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(s.jobs, 2);
+        assert_eq!(s.before.get("skip"), Some(&1));
+        assert_eq!(tier(&rust.id), "apply_now");
+        // The LLM verdict (50 → maybe) wins over the new keyword tier.
+        assert_eq!(tier(&judged.id), "maybe");
+        assert_eq!(s.after.get("apply_now"), Some(&1));
+        assert_eq!(s.after.get("maybe"), Some(&1));
     }
 }

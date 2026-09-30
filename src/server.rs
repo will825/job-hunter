@@ -8,6 +8,7 @@
 //!   POST   /api/scan              start a full scan in the background (202; 409 if one is running)
 //!   GET    /api/scan/status       progress of the current/last web scan
 //!   GET    /api/jobs?...          ranked jobs with filters
+//!   POST   /api/rescore           re-score stored jobs against the current profile
 //!
 //! Each handler opens its own SQLite connection (cheap with WAL) so we never
 //! share a non-Sync `Connection` across async tasks.
@@ -81,6 +82,7 @@ pub async fn serve(
         .route("/api/companies/:id", axum::routing::delete(delete_company))
         .route("/api/scan", post(scan))
         .route("/api/scan/status", get(scan_status))
+        .route("/api/rescore", post(rescore))
         .route("/api/jobs", get(jobs))
         .route("/api/jobs/status", post(set_job_status))
         .route("/api/jobs/note", post(set_job_note))
@@ -252,13 +254,13 @@ async fn run_web_scan(st: AppState, lock: Arc<ScanLock>) -> anyhow::Result<serde
     };
     phase("fetching");
 
-    // 1. Load profile + sources, then drop the connection before any await.
-    let (model, sources) = {
+    // 1. Load sources, then drop the connection before any await.
+    let sources = {
         let conn = db::connect(&st.db_path)?;
         let profile = profile::load_or_create(&st.profile_path)?;
         let mut sources = pipeline::load_sources(&conn)?;
         sources.extend(pipeline::adzuna_sources(&profile));
-        (profile.compile(), sources)
+        sources
     };
     let sources: Vec<_> = sources.into_iter().filter(|s| !s.is_custom()).collect();
     st.update_scan(|s| s.boards_total = sources.len());
@@ -270,9 +272,12 @@ async fn run_web_scan(st: AppState, lock: Arc<ScanLock>) -> anyhow::Result<serde
     .await;
 
     // 3. Store + prune with a fresh connection. Prune runs after store_all, so
-    //    every job seen this scan just had its last_seen refreshed.
+    //    every job seen this scan just had its last_seen refreshed. The profile
+    //    is compiled here, not at the start, so an edit made while fetching
+    //    (which re-scores stored jobs) isn't undone with the older model.
     phase("storing");
     let mut summary = {
+        let model = profile::load_or_create(&st.profile_path)?.compile();
         let conn = db::connect(&st.db_path)?;
         let mut summary = pipeline::store_all(&conn, &model, fetched)?;
         summary.pruned = db::prune_stale(&conn, pipeline::STALE_DAYS)?;
@@ -303,6 +308,40 @@ fn unix_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// `POST /api/rescore`: re-score every stored job against the current profile
+/// and return the before/after tier counts.
+async fn rescore(State(st): State<AppState>) -> Response {
+    match rescore_stored(&st).await {
+        Ok(summary) => Json(summary).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
+}
+
+/// Re-run classify + keyword score + tier on every stored job with the current
+/// profile (see `pipeline::rescore_all`). It's a pass over the whole DB, so it
+/// runs on the blocking pool with its own connection.
+async fn rescore_stored(st: &AppState) -> anyhow::Result<pipeline::RescoreSummary> {
+    let (db_path, profile_path) = (st.db_path.clone(), st.profile_path.clone());
+    tokio::task::spawn_blocking(move || {
+        let conn = db::connect(&db_path)?;
+        let model = profile::load_or_create(&profile_path)?.compile();
+        pipeline::rescore_all(&conn, &model)
+    })
+    .await?
+}
+
+/// After a profile edit, re-score stored jobs so the change shows right away.
+/// The edit itself already succeeded, so a failure here is logged, not returned.
+async fn rescore_after_profile_edit(st: &AppState) -> Option<pipeline::RescoreSummary> {
+    match rescore_stored(st).await {
+        Ok(summary) => Some(summary),
+        Err(e) => {
+            eprintln!("rescore after profile edit failed: {e:#}");
+            None
+        }
+    }
 }
 
 /// LLM re-scoring step of the web "Scan now". Opens its own short-lived
@@ -523,10 +562,11 @@ struct ListEdit {
 }
 
 async fn edit_profile_list(State(st): State<AppState>, Json(req): Json<ListEdit>) -> Response {
-    match profile::edit_list(&st.profile_path, &req.field, &req.value, req.remove) {
-        Ok(()) => Json(json!({ "ok": true })).into_response(),
-        Err(e) => err(StatusCode::BAD_REQUEST, e.to_string()),
+    if let Err(e) = profile::edit_list(&st.profile_path, &req.field, &req.value, req.remove) {
+        return err(StatusCode::BAD_REQUEST, e.to_string());
     }
+    let rescore = rescore_after_profile_edit(&st).await;
+    Json(json!({ "ok": true, "rescore": rescore })).into_response()
 }
 
 /// Upload a resume (PDF or .txt); extract text, have the LLM turn it into a
@@ -608,7 +648,11 @@ async fn upload_resume(State(st): State<AppState>, mut multipart: Multipart) -> 
     if !failed.is_empty() {
         message.push_str(&format!(" (Skipped {}: couldn't read.)", failed.len()));
     }
-    Json(json!({ "ok": true, "message": message })).into_response()
+    let rescore = rescore_after_profile_edit(&st).await;
+    if let Some(r) = &rescore {
+        message.push_str(&format!(" Re-scored {} job(s).", r.jobs));
+    }
+    Json(json!({ "ok": true, "message": message, "rescore": rescore })).into_response()
 }
 
 /// Extract plain text from an uploaded resume. Handles PDF (default) and .txt.

@@ -10,6 +10,7 @@
 //!   cargo run -- add <url>         watch a company board by pasting its link
 //!   cargo run -- list              list watched companies
 //!   cargo run -- remove <id>       stop watching a company (id from `list`)
+//!   cargo run -- rescore           re-score every stored job against the current profile
 //!
 //! Robustness is deliberate: one board failing (bad token, network blip, API
 //! drift) logs a warning and the run continues — it never aborts the whole scan.
@@ -45,7 +46,7 @@ const WEB_PORT: u16 = 8787;
 const ENV_FILE: &str = ".env";
 
 /// Subcommands `main` dispatches; anything else is rejected before the DB is touched.
-const KNOWN_COMMANDS: &[&str] = &["serve", "add", "list", "remove", "digest", "dedupe"];
+const KNOWN_COMMANDS: &[&str] = &["serve", "add", "list", "remove", "digest", "dedupe", "rescore"];
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -63,7 +64,7 @@ async fn main() -> Result<()> {
     let command = args.first().map(String::as_str);
     if let Some(other) = command.filter(|c| !KNOWN_COMMANDS.contains(c)) {
         return Err(anyhow!(
-            "unknown command '{other}'. Use: (no args) | serve | add <url> | list | remove <id> | digest | dedupe"
+            "unknown command '{other}'. Use: (no args) | serve | add <url> | list | remove <id> | digest | dedupe | rescore"
         ));
     }
 
@@ -87,6 +88,7 @@ async fn main() -> Result<()> {
         Some("remove") => cmd_remove(args.get(1)),
         Some("digest") => cmd_digest(&client).await,
         Some("dedupe") => cmd_dedupe().await,
+        Some("rescore") => cmd_rescore().await,
         Some(other) => unreachable!("unknown command '{other}' rejected above"),
         None => cmd_scan(&client).await,
     }
@@ -290,6 +292,23 @@ async fn cmd_dedupe() -> Result<()> {
     let before = db::count_jobs(&conn)?;
     let merged = db::dedupe_aggregators(&conn)?;
     println!("Merged {merged} duplicate aggregator row(s) ({before} → {} jobs).", db::count_jobs(&conn)?);
+    Ok(())
+}
+
+/// `rescore`: re-run classification + keyword scoring on every stored job with
+/// the current profile, so scoring/profile changes apply without a re-fetch.
+/// Holds the scan lock so a scan can't overwrite it with its older model.
+async fn cmd_rescore() -> Result<()> {
+    let _lock = scan_lock::ScanLock::acquire_waiting(SCAN_LOCK_PATH, SCAN_LOCK_WAIT).await?;
+    let conn = db::connect(DB_PATH)?;
+    let model = profile::load_or_create(PROFILE_PATH)?.compile();
+    let s = pipeline::rescore_all(&conn, &model)?;
+    println!("Re-scored {} job(s) with the current profile.\n", s.jobs);
+    println!("  {:<10} {:>7} {:>7}", "tier", "before", "after");
+    for tier in ["apply_now", "strong", "maybe", "skip"] {
+        let count = |m: &std::collections::BTreeMap<String, i64>| m.get(tier).copied().unwrap_or(0);
+        println!("  {:<10} {:>7} {:>7}", tier, count(&s.before), count(&s.after));
+    }
     Ok(())
 }
 
