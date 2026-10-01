@@ -10,6 +10,9 @@
 //!   GET    /api/jobs?...          ranked jobs with filters
 //!   POST   /api/rescore           re-score stored jobs against the current profile
 //!
+//! If `JOBHUNTER_TOKEN` is set, every /api route requires it (header
+//! `X-Token`, or the `jh_token` cookie that `GET /?token=...` sets once).
+//!
 //! Each handler opens its own SQLite connection (cheap with WAL) so we never
 //! share a non-Sync `Connection` across async tasks.
 
@@ -17,9 +20,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use axum::{
-    extract::{Multipart, Path, Query, State},
-    http::StatusCode,
-    response::{Html, IntoResponse, Response},
+    extract::{Multipart, Path, Query, Request, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -36,6 +40,8 @@ struct AppState {
     lock_path: Arc<String>,
     client: reqwest::Client,
     scan: Arc<Mutex<ScanStatus>>,
+    /// Optional shared secret from `JOBHUNTER_TOKEN`; `None` = open (no auth).
+    token: Option<Arc<String>>,
 }
 
 /// Progress of the current (or most recent) web scan, polled by the UI.
@@ -81,7 +87,13 @@ pub async fn serve(
         lock_path: Arc::new(lock_path),
         client,
         scan: Arc::new(Mutex::new(ScanStatus::default())),
+        token: std::env::var("JOBHUNTER_TOKEN")
+            .ok()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .map(Arc::new),
     };
+    let token_on = state.token.is_some();
 
     let app = Router::new()
         .route("/", get(index))
@@ -99,6 +111,7 @@ pub async fn serve(
         .route("/api/profile/list", post(edit_profile_list))
         .route("/api/profile/resume", post(upload_resume))
         .route("/api/profile/email", post(set_email))
+        .layer(middleware::from_fn_with_state(state.clone(), require_token))
         .with_state(state);
 
     // Listen on all interfaces so the dashboard is reachable from other devices
@@ -110,6 +123,9 @@ pub async fn serve(
     println!("\n  Job Hunter web UI running:");
     println!("    on this Mac:      {url}");
     println!("    on your network:  http://<this-mac-ip>:{port}");
+    if token_on {
+        println!("  JOBHUNTER_TOKEN is set: open {url}/?token=<token> once per browser.");
+    }
     println!("  (press Ctrl-C to stop)\n");
     // Only pop a browser when launched interactively on the Mac — not as a
     // background service, and not on the Pi (no `open` command there).
@@ -125,8 +141,70 @@ fn err(code: StatusCode, msg: impl Into<String>) -> Response {
     (code, Json(json!({ "error": msg.into() }))).into_response()
 }
 
-async fn index() -> Html<&'static str> {
-    Html(INDEX_HTML)
+const TOKEN_COOKIE: &str = "jh_token";
+
+/// The page is static; its only data comes from the /api routes. With a token
+/// configured, `/?token=<token>` stores it in a cookie and redirects to `/` so
+/// it doesn't linger in the address bar or history.
+async fn index(
+    State(st): State<AppState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    if let (Some(want), Some(got)) = (&st.token, q.get("token")) {
+        if ct_eq(want.as_bytes(), got.as_bytes()) {
+            let cookie = format!(
+                "{TOKEN_COOKIE}={want}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000"
+            );
+            let mut resp = Redirect::to("/").into_response();
+            if let Ok(v) = HeaderValue::from_str(&cookie) {
+                resp.headers_mut().insert(header::SET_COOKIE, v);
+            }
+            return resp;
+        }
+    }
+    let mut resp = Html(INDEX_HTML).into_response();
+    let h = resp.headers_mut();
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; \
+             style-src 'self' 'unsafe-inline'; img-src 'self' data:",
+        ),
+    );
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    resp
+}
+
+/// Gate /api/* behind `JOBHUNTER_TOKEN` when it's set; a no-op otherwise.
+async fn require_token(State(st): State<AppState>, req: Request, next: Next) -> Response {
+    let Some(want) = &st.token else {
+        return next.run(req).await;
+    };
+    if !req.uri().path().starts_with("/api") || token_ok(req.headers(), want) {
+        return next.run(req).await;
+    }
+    err(StatusCode::UNAUTHORIZED, "missing or wrong token")
+}
+
+fn token_ok(headers: &HeaderMap, want: &str) -> bool {
+    let header = headers.get("x-token").and_then(|v| v.to_str().ok());
+    let cookie = headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .filter_map(|kv| kv.trim().split_once('='))
+        .find(|(k, _)| *k == TOKEN_COOKIE)
+        .map(|(_, v)| v);
+    [header, cookie]
+        .into_iter()
+        .flatten()
+        .any(|got| ct_eq(want.as_bytes(), got.as_bytes()))
+}
+
+/// Constant-time comparison, so response timing doesn't leak the token.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 async fn list_companies(State(st): State<AppState>) -> Response {
@@ -700,3 +778,33 @@ fn extract_resume_text(filename: &str, bytes: &[u8]) -> anyhow::Result<String> {
 }
 
 const INDEX_HTML: &str = include_str!("web/index.html");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.append(*k, HeaderValue::from_str(v).unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn token_via_header_or_cookie() {
+        assert!(token_ok(&headers(&[("x-token", "s3cret")]), "s3cret"));
+        assert!(token_ok(&headers(&[("cookie", "a=1; jh_token=s3cret")]), "s3cret"));
+        assert!(!token_ok(&headers(&[("x-token", "nope")]), "s3cret"));
+        assert!(!token_ok(&headers(&[("cookie", "jh_token=s3cre")]), "s3cret"));
+        assert!(!token_ok(&headers(&[("cookie", "other=s3cret")]), "s3cret"));
+        assert!(!token_ok(&HeaderMap::new(), "s3cret"));
+    }
+
+    #[test]
+    fn ct_eq_matches_only_identical() {
+        assert!(ct_eq(b"abc", b"abc"));
+        assert!(!ct_eq(b"abc", b"abd"));
+        assert!(!ct_eq(b"abc", b"ab"));
+    }
+}

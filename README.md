@@ -160,7 +160,9 @@ It currently runs on a **Raspberry Pi 3B** (1 GB RAM, Raspberry Pi OS Lite 64-bi
 
 - **Your data never leaves your machine.** `.env` (keys), `profile.toml` (name, bio, email), and `jobs.db` are all gitignored.
 - Only two things are ever sent to third parties, and only if you configure them: job **descriptions** go to Groq for scoring, and the **digest** goes through Resend. No resume or personal data is sent to either.
-- The dashboard has **no authentication** — it's designed for `localhost` or a private network (Tailscale), never a public URL.
+- The dashboard is designed for `localhost` or a private network (Tailscale), never a public URL. By default it has **no authentication**.
+- **Optional shared secret:** set `JOBHUNTER_TOKEN` in `.env` (letters and digits, e.g. `openssl rand -hex 32`) and every `/api` route requires it. Open `http://<host>:8787/?token=<token>` once per browser; the server stores it in an `HttpOnly`, `SameSite=Strict` cookie and redirects to `/`. Scripts can send it as an `X-Token` header instead. Leave it unset to keep the open behavior.
+- The page is served with a `Content-Security-Policy` (`default-src 'self'`) and `X-Content-Type-Options: nosniff`, and every field from the job feeds is HTML-escaped; job links are only rendered if they're `http(s)://`.
 - No scraping of ToS-protected sites (LinkedIn/Indeed); only official ATS and aggregator APIs.
 
 ---

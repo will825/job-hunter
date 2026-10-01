@@ -50,7 +50,7 @@ Watched companies, Digest email, Settings. It talks to the `/api/*` JSON routes 
 ## Module map
 
 - `src/main.rs` — CLI entry, `.env` loader, subcommands: (none)=scan, `serve`, `add <url>`, `list`, `remove <id>`, `digest`, `dedupe`, `rescore`, `doctor` (setup checks; runs before `db::init`, never creates files).
-- `src/server.rs` — axum router + JSON API handlers; binds `0.0.0.0:8787`, no auth.
+- `src/server.rs` — axum router + JSON API handlers; binds `0.0.0.0:8787`; optional `JOBHUNTER_TOKEN` gates `/api/*` (X-Token header or `jh_token` cookie). `GET /` sends CSP + nosniff; the UI escapes all API data with `esc()`/`safeUrl()` and uses delegated listeners (no inline handlers with data).
 - `src/scan_lock.rs` — cross-process scan lock file (create_new; takeover when holder pid is dead).
 - `src/pipeline.rs` — fetch/store/prune/rescore orchestration, `full_scan`, Adzuna source expansion.
 - `src/db.rs` — SQLite schema (`jobs`, `meta`, `companies`), `migrate`, seeding, upsert/dedup, queries.

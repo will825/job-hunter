@@ -337,7 +337,19 @@ button:disabled{opacity:.5;cursor:default;box-shadow:none}
 </div>
 <script>
 const $ = id => document.getElementById(id);
-const esc = s => (s||'').replace(/[&<>]/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[m]));
+// Everything from the API (job feeds are third-party data) goes through esc()
+// before it lands in HTML, and every href through safeUrl().
+const esc = s => String(s ?? '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+const safeUrl = u => { u = String(u ?? '').trim(); return /^https?:\/\//i.test(u) ? u : '#'; };
+
+// With JOBHUNTER_TOKEN set on the server, the API answers 401 until this
+// browser has the token cookie (set by opening /?token=... once).
+const rawFetch = window.fetch.bind(window);
+window.fetch = async (...args) => {
+  const r = await rawFetch(...args);
+  if(r.status === 401) $('scanMsg').textContent = 'Locked — open this page once as /?token=<your JOBHUNTER_TOKEN>.';
+  return r;
+};
 
 async function loadCompanies(){
   const r = await fetch('/api/companies'); const d = await r.json();
@@ -346,7 +358,7 @@ async function loadCompanies(){
   $('coCount').textContent = list.length ? `(${list.length})` : '';
   if(!list.length){ el.innerHTML = '<span class="muted">No companies yet — add one above.</span>'; return; }
   el.innerHTML = list.map(c =>
-    `<span class="chip"><span class="ats">${esc(c.ats)}</span> ${esc(c.token)}<button title="Remove" onclick="del(${c.id})">×</button></span>`
+    `<span class="chip"><span class="ats">${esc(c.ats)}</span> ${esc(c.token)}<button title="Remove" data-id="${esc(c.id)}">×</button></span>`
   ).join('');
 }
 
@@ -364,8 +376,11 @@ async function addCompany(){
   $('addBtn').disabled = false; $('addBtn').textContent = 'Add';
 }
 
+$('companies').addEventListener('click', e => {
+  const b = e.target.closest('button[data-id]'); if(b) del(b.dataset.id);
+});
 async function del(id){
-  await fetch('/api/companies/'+id, {method:'DELETE'});
+  await fetch('/api/companies/'+encodeURIComponent(id), {method:'DELETE'});
   loadCompanies();
 }
 
@@ -447,7 +462,7 @@ function reloadCurrentView(){
 function moreLocations(j){
   const locs = j.locations || [];
   if(locs.length <= 1) return '';
-  return ` <span class="pill" title="${escAttr(locs.join(' · '))}">+${locs.length - 1} location${locs.length > 2 ? 's' : ''}</span>`;
+  return ` <span class="pill" title="${esc(locs.join(' · '))}">+${locs.length - 1} location${locs.length > 2 ? 's' : ''}</span>`;
 }
 
 function cardHtml(j, ctx){
@@ -456,29 +471,37 @@ function cardHtml(j, ctx){
   const aiTag = hasAi ? '<span class="pill ai">AI fit</span>' : '';
   const reason = (hasAi && j.llm_reasoning) ? `<div class="reason">${esc(j.llm_reasoning)}</div>` : '';
   const saved = j.status === 'saved';
+  const id = esc(j.id);
   let actions;
   if(ctx === 'applied'){
     actions = `<span class="act done">Applied</span>
-       <button class="act x" onclick="jobAction('${j.id}','active',event)" title="Move back to matches">Undo</button>`;
+       <button class="act x" data-id="${id}" data-act="active" title="Move back to matches">Undo</button>`;
   } else if(ctx === 'saved'){
-    actions = `<button class="act" onclick="jobAction('${j.id}','applied',event)" title="Mark as applied">Applied</button>
-       <button class="act x" onclick="jobAction('${j.id}','active',event)" title="Remove from saved">Remove</button>`;
+    actions = `<button class="act" data-id="${id}" data-act="applied" title="Mark as applied">Applied</button>
+       <button class="act x" data-id="${id}" data-act="active" title="Remove from saved">Remove</button>`;
   } else {
-    actions = `<button class="act${saved?' on':''}" onclick="jobAction('${j.id}','saved',event)" title="Save">${saved?'Saved':'Save'}</button>
-       <button class="act" onclick="jobAction('${j.id}','applied',event)" title="Mark as applied">Applied</button>
-       <button class="act x" onclick="jobAction('${j.id}','dismissed',event)" title="Dismiss">×</button>`;
+    actions = `<button class="act${saved?' on':''}" data-id="${id}" data-act="saved" title="Save">${saved?'Saved':'Save'}</button>
+       <button class="act" data-id="${id}" data-act="applied" title="Mark as applied">Applied</button>
+       <button class="act x" data-id="${id}" data-act="dismissed" title="Dismiss">×</button>`;
   }
-  return `<div class="card"><div class="sc${hasAi?' scored':''}">${score}</div>
+  return `<div class="card"><div class="sc${hasAi?' scored':''}">${esc(score)}</div>
     <div style="flex:1;min-width:0">
-      <h3><a href="${j.url}" target="_blank" rel="noopener">${esc(j.title)}</a></h3>
-      <div class="row"><span class="badge ${j.tier}">${j.tier.replace('_',' ')}</span>${aiTag}
-      <span class="pill">${esc(j.company)}</span><span class="pill">${j.work_mode}</span>
-      <span class="pill">${j.region}</span><span class="pill">${j.seniority}</span>
+      <h3><a href="${esc(safeUrl(j.url))}" target="_blank" rel="noopener">${esc(j.title)}</a></h3>
+      <div class="row"><span class="badge ${esc(j.tier)}">${esc(String(j.tier ?? '').replace('_',' '))}</span>${aiTag}
+      <span class="pill">${esc(j.company)}</span><span class="pill">${esc(j.work_mode)}</span>
+      <span class="pill">${esc(j.region)}</span><span class="pill">${esc(j.seniority)}</span>
       <span style="color:#6b7480">${esc(j.location)}</span>${moreLocations(j)}</div>
       ${reason}
     </div>
     <div class="cardactions">${actions}</div>
   </div>`;
+}
+
+// One delegated listener per container instead of inline onclick handlers,
+// so job ids never get spliced into JS source.
+function onJobActionClick(e){
+  const b = e.target.closest('button[data-act]');
+  if(b) jobAction(b.dataset.id, b.dataset.act, e);
 }
 
 let lastUndo = null;
@@ -578,7 +601,6 @@ const STAGES = [
   {key:'offer', label:'Offer'},
   {key:'rejected', label:'Rejected'},
 ];
-const escAttr = s => esc(s).replace(/"/g,'&quot;');
 
 async function loadTracker(){
   const r = await fetch('/api/tracker'); const d = await r.json();
@@ -593,18 +615,27 @@ async function loadTracker(){
 function trackerCard(j){
   const hasAi = j.llm_score !== null && j.llm_score !== undefined;
   const score = hasAi ? j.llm_score : j.keyword_score;
+  const id = esc(j.id);
   const opts = STAGES.map(s => `<option value="${s.key}"${s.key===j.status?' selected':''}>${s.label}</option>`).join('');
   return `<div class="minicard">
     <div class="minitop">
-      <span class="miniscore${hasAi?' scored':''}">${score}</span>
-      <a href="${j.url}" target="_blank" rel="noopener" class="minititle">${esc(j.title)}</a>
-      <button class="act x mini" onclick="jobAction('${j.id}','active',event)" title="Remove from tracker">×</button>
+      <span class="miniscore${hasAi?' scored':''}">${esc(score)}</span>
+      <a href="${esc(safeUrl(j.url))}" target="_blank" rel="noopener" class="minititle">${esc(j.title)}</a>
+      <button class="act x mini" data-id="${id}" data-act="active" title="Remove from tracker">×</button>
     </div>
     <div class="minico">${esc(j.company)}</div>
-    <input class="mininote" placeholder="Add a note…" value="${escAttr(j.note||'')}" onchange="saveNote('${j.id}',this.value)">
-    <select class="ministage" onchange="jobAction('${j.id}',this.value,event)">${opts}</select>
+    <input class="mininote" placeholder="Add a note…" value="${esc(j.note)}" data-id="${id}">
+    <select class="ministage" data-id="${id}">${opts}</select>
   </div>`;
 }
+
+$('jobs').addEventListener('click', onJobActionClick);
+$('board').addEventListener('click', onJobActionClick);
+$('board').addEventListener('change', e => {
+  const el = e.target;
+  if(el.matches('.mininote')) saveNote(el.dataset.id, el.value);
+  else if(el.matches('.ministage')) jobAction(el.dataset.id, el.value, e);
+});
 
 async function saveNote(id, note){
   await fetch('/api/jobs/note',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,note})});
@@ -621,13 +652,13 @@ function swipeCardInner(j){
   const hasAi = j.llm_score !== null && j.llm_score !== undefined;
   const score = hasAi ? j.llm_score : j.keyword_score;
   const reason = j.llm_reasoning ? esc(j.llm_reasoning) : 'Matched on your keywords — not AI-reviewed yet.';
-  return `<div class="swipetop"><span class="swipescore${hasAi?'':' plain'}">${score}</span>
+  return `<div class="swipetop"><span class="swipescore${hasAi?'':' plain'}">${esc(score)}</span>
       <div><div class="swipetitle">${esc(j.title)}</div><div class="swipeco">${esc(j.company)}</div></div></div>
-    <div class="swipetags"><span class="badge ${j.tier}">${j.tier.replace('_',' ')}</span>
-      <span class="pill">${j.work_mode}</span><span class="pill">${j.region}</span>
-      <span class="pill">${j.seniority}</span><span class="pill">${esc(j.location)}</span>${moreLocations(j)}</div>
+    <div class="swipetags"><span class="badge ${esc(j.tier)}">${esc(String(j.tier ?? '').replace('_',' '))}</span>
+      <span class="pill">${esc(j.work_mode)}</span><span class="pill">${esc(j.region)}</span>
+      <span class="pill">${esc(j.seniority)}</span><span class="pill">${esc(j.location)}</span>${moreLocations(j)}</div>
     <div class="swipereason">${reason}</div>
-    <div class="swipelink"><a href="${j.url}" target="_blank" rel="noopener">View full posting →</a></div>`;
+    <div class="swipelink"><a href="${esc(safeUrl(j.url))}" target="_blank" rel="noopener">View full posting →</a></div>`;
 }
 function renderSwipe(){
   const stack = $('swipeStack'); if(!stack) return;
@@ -715,8 +746,8 @@ async function swipeUndo(){
 }
 
 function bar(label, val, max){
-  const w = Math.max(2, (val/max)*100);
-  return `<div class="barrow"><div class="barlbl">${label}</div><div class="bartrack"><div class="barfill" style="width:${w}%"></div></div><div class="barval">${val}</div></div>`;
+  const w = Math.max(2, (Number(val)/max)*100) || 2;
+  return `<div class="barrow"><div class="barlbl">${esc(label)}</div><div class="bartrack"><div class="barfill" style="width:${w}%"></div></div><div class="barval">${esc(val)}</div></div>`;
 }
 
 async function loadAnalytics(){
@@ -724,7 +755,7 @@ async function loadAnalytics(){
   const pipeSum = Object.values(d.pipeline).reduce((a,b)=>a+b,0);
   const appliedPlus = d.pipeline.applied + d.pipeline.interviewing + d.pipeline.offer + d.pipeline.rejected;
   const tiles = [['Total jobs', d.total],['Apply-now matches', d.tiers.apply_now],['In pipeline', pipeSum],['Applied', appliedPlus]];
-  const tileHtml = tiles.map(t=>`<div class="tile"><div class="tilenum">${t[1]}</div><div class="tilelbl">${t[0]}</div></div>`).join('');
+  const tileHtml = tiles.map(t=>`<div class="tile"><div class="tilenum">${esc(t[1])}</div><div class="tilelbl">${esc(t[0])}</div></div>`).join('');
 
   const stages = [['saved','Saved'],['applied','Applied'],['interviewing','Interviewing'],['offer','Offer'],['rejected','Rejected']];
   const pmax = Math.max(1, ...stages.map(s=>d.pipeline[s[0]]));
@@ -736,8 +767,8 @@ async function loadAnalytics(){
 
   const sgmax = Math.max(1, ...d.sources.map(s=>s.good));
   const srcBars = d.sources.filter(s=>s.total>0).map(s=>{
-    const w = Math.max(2, (s.good/sgmax)*100);
-    return `<div class="barrow"><div class="barlbl">${esc(s.source)}</div><div class="bartrack"><div class="barfill" style="width:${w}%"></div></div><div class="barval">${s.good}<span class="barsub">/${s.total}</span></div></div>`;
+    const w = Math.max(2, (Number(s.good)/sgmax)*100) || 2;
+    return `<div class="barrow"><div class="barlbl">${esc(s.source)}</div><div class="bartrack"><div class="barfill" style="width:${w}%"></div></div><div class="barval">${esc(s.good)}<span class="barsub">/${esc(s.total)}</span></div></div>`;
   }).join('');
 
   $('analytics').innerHTML = `
@@ -779,7 +810,7 @@ async function saveEmail(){
 }
 function renderChips(elId, field, items){
   $(elId).innerHTML = items.map(v =>
-    `<span class="chip">${esc(v)}<button title="Remove" onclick="delP('${field}','${encodeURIComponent(v)}')">×</button></span>`
+    `<span class="chip">${esc(v)}<button title="Remove" data-field="${esc(field)}" data-value="${esc(v)}">×</button></span>`
   ).join('') || '<span class="muted">none yet</span>';
 }
 async function uploadResume(){
@@ -803,8 +834,12 @@ async function addP(field, inputId){
   const r = await fetch('/api/profile/list',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({field,value})});
   el.value=''; loadProfile(); followRescore(r);
 }
-async function delP(field, encValue){
-  const value = decodeURIComponent(encValue);
+for(const id of ['rolesChips','skillsChips','interestsChips']){
+  $(id).addEventListener('click', e => {
+    const b = e.target.closest('button[data-field]'); if(b) delP(b.dataset.field, b.dataset.value);
+  });
+}
+async function delP(field, value){
   const r = await fetch('/api/profile/list',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({field,value,remove:true})});
   loadProfile(); followRescore(r);
 }
