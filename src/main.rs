@@ -42,6 +42,8 @@ const SCAN_LOCK_PATH: &str = "jobhunter.scan.lock";
 /// How long the CLI waits for another scan to finish before giving up.
 const SCAN_LOCK_WAIT: Duration = Duration::from_secs(10 * 60);
 const WEB_PORT: u16 = 8787;
+/// How long the digest waits before re-checking Groq after a network failure.
+const DIGEST_CHECK_RETRY_WAIT: Duration = Duration::from_secs(2 * 60);
 
 const ENV_FILE: &str = ".env";
 
@@ -185,7 +187,18 @@ async fn cmd_digest(client: &reqwest::Client) -> Result<()> {
     let profile = profile::load_or_create(PROFILE_PATH)?;
     let cfg = llm::LlmConfig::from_profile(&profile);
     let llm_skip = if cfg.is_ready() {
-        llm::check_model(&cfg, client).await.err()
+        match llm::check_model(&cfg, client).await {
+            // Groq unreachable (network/timeout): give it one more chance.
+            Err(e) if e.network => {
+                println!(
+                    "Daily digest: couldn't reach Groq ({e}) — retrying in {}s.",
+                    DIGEST_CHECK_RETRY_WAIT.as_secs()
+                );
+                tokio::time::sleep(DIGEST_CHECK_RETRY_WAIT).await;
+                llm::check_model(&cfg, client).await.err().map(|e| e.message)
+            }
+            r => r.err().map(|e| e.message),
+        }
     } else {
         None
     };

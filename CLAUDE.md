@@ -30,7 +30,7 @@ Runs 24/7 on a Raspberry Pi (systemd service + 7 AM digest cron); see `schedulin
    over 60s, or "per day" in the body) is `llm::QuotaExhausted`: no retries, breaker trips at
    once, `llm_error` = "Groq daily quota used up". Estimated prompt tokens go in `last_run`.
 5. **Digest** — `job_hunter digest` first runs `llm::check_model` (one tiny Groq request); if it
-   fails, the LLM step is skipped and the digest falls back to keyword matches with the reason in
+   fails (after one retry 2 min later if Groq was unreachable), the LLM step is skipped and the digest falls back to keyword matches with the reason in
    the banner. Emails new apply_now/strong matches via Resend, marks `notified_at`. First run only baselines (meta key `digest_baselined`).
 
 CLI `scan`/`digest` use `pipeline::full_scan`. The web "Scan now" (`POST /api/scan`) returns 202

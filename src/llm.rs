@@ -358,10 +358,24 @@ pub fn model_unavailable(model: &str) -> String {
     )
 }
 
+/// Why [`check_model`] failed: a one-line, user-facing `message`, and whether
+/// Groq was never reached (`network`: connect error or timeout, no HTTP
+/// response), which is worth retrying later — unlike an answer from Groq.
+#[derive(Debug, PartialEq)]
+pub struct ModelCheckError {
+    pub message: String,
+    pub network: bool,
+}
+
+impl std::fmt::Display for ModelCheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 /// Make one tiny Groq request with the configured model, to catch a retired
-/// model or bad key before a run depends on it. `Err` is a one-line,
-/// user-facing reason. Assumes `cfg.is_ready()`.
-pub async fn check_model(cfg: &LlmConfig, client: &reqwest::Client) -> std::result::Result<(), String> {
+/// model or bad key before a run depends on it. Assumes `cfg.is_ready()`.
+pub async fn check_model(cfg: &LlmConfig, client: &reqwest::Client) -> std::result::Result<(), ModelCheckError> {
     let body = json!({
         "model": cfg.model,
         "max_tokens": 16,
@@ -369,14 +383,22 @@ pub async fn check_model(cfg: &LlmConfig, client: &reqwest::Client) -> std::resu
     });
     match groq_send(cfg, client, &body).await {
         Ok(_) => Ok(()),
-        Err(e) => Err(match e.downcast_ref::<GroqStatus>() {
-            // Groq answers 404 (model_not_found) for a retired model, 400 for
-            // an id it doesn't accept.
-            Some(s) if s.status == 404 || s.status == 400 => model_unavailable(&cfg.model),
-            Some(s) if s.status == 401 => "Groq rejected GROQ_API_KEY (401 Unauthorized)".to_string(),
-            _ => format!("{e:#}"),
-        }),
+        Err(e) => Err(model_check_error(&cfg.model, &e)),
     }
+}
+
+fn model_check_error(model: &str, e: &anyhow::Error) -> ModelCheckError {
+    let message = match e.downcast_ref::<GroqStatus>() {
+        // Groq answers 404 (model_not_found) for a retired model, 400 for an
+        // id it doesn't accept.
+        Some(s) if s.status == 404 || s.status == 400 => model_unavailable(model),
+        Some(s) if s.status == 401 => "Groq rejected GROQ_API_KEY (401 Unauthorized)".to_string(),
+        _ => format!("{e:#}"),
+    };
+    // Only a transport failure carries a reqwest::Error; any HTTP answer from
+    // Groq becomes a GroqStatus / QuotaExhausted instead.
+    let network = e.chain().any(|c| c.is::<reqwest::Error>());
+    ModelCheckError { message, network }
 }
 
 /// Retries allowed after the first Groq request.
@@ -550,11 +572,22 @@ mod tests {
         cfg.model = "old-model".into();
         cfg.api_url = one_shot_server(resp).await;
         let err = check_model(&cfg, &reqwest::Client::new()).await.unwrap_err();
+        assert!(!err.network, "Groq answered, so it's not a network failure");
         assert_eq!(
-            err,
+            err.message,
             "model old-model is not available — pick a current one from \
              https://console.groq.com/docs/models and set [llm] model in profile.toml"
         );
+    }
+
+    #[tokio::test]
+    async fn unreachable_groq_is_a_network_failure() {
+        // Port 1 on loopback refuses the connection at once.
+        let e = reqwest::Client::new().get("http://127.0.0.1:1/").send().await.unwrap_err();
+        let err = model_check_error("m", &anyhow::Error::new(e).context("calling Groq"));
+        assert!(err.network);
+        let status = anyhow::Error::new(GroqStatus { status: 503, message: "Groq returned 503".into() });
+        assert!(!model_check_error("m", &status).network);
     }
 
     #[tokio::test]
