@@ -8,6 +8,7 @@
 //!   POST   /api/scan              start a full scan in the background (202; 409 if one is running)
 //!   GET    /api/scan/status       progress of the current/last web scan
 //!   GET    /api/jobs?...          ranked jobs with filters, paged ({jobs, total})
+//!   GET    /api/jobs/:id          one job with description, AI gaps, and age
 //!   POST   /api/rescore           re-score stored jobs against the current profile
 //!
 //! If `JOBHUNTER_TOKEN` is set, every /api route requires it (header
@@ -103,6 +104,7 @@ pub async fn serve(
         .route("/api/scan/status", get(scan_status))
         .route("/api/rescore", post(rescore))
         .route("/api/jobs", get(jobs))
+        .route("/api/jobs/:id", get(job_detail))
         .route("/api/jobs/status", post(set_job_status))
         .route("/api/jobs/note", post(set_job_note))
         .route("/api/tracker", get(tracker))
@@ -544,6 +546,18 @@ async fn jobs(State(st): State<AppState>, Query(q): Query<HashMap<String, String
     let sort = get("sort").unwrap_or("best");
     match db::search_jobs(&conn, &filter, sort, limit, offset) {
         Ok((rows, total)) => Json(json!({ "jobs": rows, "total": total })).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn job_detail(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+    let conn = match db::connect(&st.db_path) {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    match db::job_detail(&conn, &id) {
+        Ok(Some(job)) => Json(job).into_response(),
+        Ok(None) => err(StatusCode::NOT_FOUND, "No such job (it may have expired)."),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }

@@ -63,6 +63,15 @@ button:disabled{opacity:.5;cursor:default;box-shadow:none}
 .pgroup{margin-bottom:14px}
 .plabel{font-size:11px;color:#8a94a3;margin-bottom:7px;text-transform:uppercase;letter-spacing:.5px;font-weight:600}
 .reason{color:#6b7280;font-size:13.5px;margin-top:7px;line-height:1.45}
+/* Lazy-loaded job details (Home card toggle + Swipe card) */
+.dtoggle{margin-top:8px;padding:0;border:0;background:none;color:#0a84ff;font-size:13px;font-weight:600;cursor:pointer}
+@media(hover:hover){.dtoggle:hover{text-decoration:underline}}
+.details{margin-top:10px;padding-top:10px;border-top:1px solid rgba(120,130,150,.18)}
+.dage{font-size:12px;color:#8a94a3;margin-bottom:8px}
+.ddesc{white-space:pre-line;color:#3a4150;font-size:13.5px;line-height:1.5;overflow-wrap:anywhere}
+.dgaps{margin-top:10px;font-size:13px;color:#3a4150}
+.dgaps ul{margin:4px 0 0;padding-left:18px}.dgaps li{margin:2px 0}
+.dgaps .plabel{margin-bottom:2px}
 .controls{display:flex;gap:9px;flex-wrap:wrap;margin-bottom:14px}
 .controls #q{flex:1;min-width:160px}
 .controls .tgl{display:flex;align-items:center;gap:6px;font-size:13px;color:#4b5563;white-space:nowrap;cursor:pointer}
@@ -178,6 +187,8 @@ button:disabled{opacity:.5;cursor:default;box-shadow:none}
 .sbtn.nope{color:#c0392b}.sbtn.like{color:#1a8a4a}.sbtn.undo{color:#5b6675;padding:13px 22px}
 @media(hover:hover){.sbtn:hover{filter:brightness(1.05)}}
 .sbtn:focus{outline:none}
+.swipekeys{margin-top:12px;font-size:12px;color:#8a94a3}
+.swipekeys kbd{font:inherit;font-weight:600;padding:1px 6px;border-radius:5px;background:rgba(255,255,255,.7);border:1px solid rgba(120,130,150,.25)}
 .swipedone{text-align:center;color:#6b7280;padding:70px 20px;font-size:16px;line-height:1.6}
 /* --- Undo toast --- */
 .toast{position:fixed;bottom:26px;left:50%;transform:translateX(-50%) translateY(160%);background:rgba(28,32,42,.92);backdrop-filter:blur(14px) saturate(160%);-webkit-backdrop-filter:blur(14px) saturate(160%);color:#fff;padding:12px 14px 12px 18px;border-radius:16px;box-shadow:0 16px 40px rgba(0,0,0,.28);display:flex;align-items:center;gap:16px;font-size:14px;font-weight:500;z-index:200;transition:transform .28s cubic-bezier(.2,.8,.2,1);max-width:92vw}
@@ -226,7 +237,7 @@ button:disabled{opacity:.5;cursor:default;box-shadow:none}
 
     <section id="view-swipe" class="view hidden">
       <h1 class="viewhead">Swipe <span style="font-size:14px;font-weight:500;color:#8a94a3">— test mode</span></h1>
-      <p class="viewsub">One job at a time. Drag right to save, left to pass — or use the buttons.</p>
+      <p class="viewsub">One job at a time. Drag right to save, left to pass — or use the buttons or arrow keys.</p>
       <div class="swipearea">
         <div id="swipeStack" class="swipestack"></div>
         <div class="swipebtns">
@@ -234,6 +245,7 @@ button:disabled{opacity:.5;cursor:default;box-shadow:none}
           <button class="sbtn undo" onclick="swipeUndo()">Undo</button>
           <button class="sbtn like" onclick="swipeCommit('saved')">Save</button>
         </div>
+        <div class="swipekeys"><kbd>←</kbd> pass · <kbd>→</kbd> save · <kbd>U</kbd> undo · <kbd>O</kbd> open posting</div>
       </div>
     </section>
 
@@ -470,6 +482,60 @@ function moreLocations(j){
   return ` <span class="pill" title="${esc(locs.join(' · '))}">+${locs.length - 1} location${locs.length > 2 ? 's' : ''}</span>`;
 }
 
+// --- Job details (GET /api/jobs/:id), fetched once per job on demand ---
+const detailCache = new Map();
+function fetchDetail(id){
+  if(!detailCache.has(id)){
+    const p = fetch('/api/jobs/'+encodeURIComponent(id)).then(async r => {
+      const d = await r.json().catch(() => ({}));
+      if(!r.ok) throw new Error(d.error || 'Could not load details.');
+      return d;
+    });
+    p.catch(() => detailCache.delete(id)); // let a later click retry
+    detailCache.set(id, p);
+  }
+  return detailCache.get(id);
+}
+
+// The first ~n chars, cut at a word boundary, paragraph breaks kept.
+function excerpt(text, n = 1200){
+  const t = String(text ?? '').replace(/\n{3,}/g, '\n\n').trim();
+  if(t.length <= n) return t;
+  const cut = t.slice(0, n), sp = cut.lastIndexOf(' ');
+  return (sp > n * 0.8 ? cut.slice(0, sp) : cut).trimEnd() + '…';
+}
+
+function ageText(d){
+  const n = d.age_days;
+  if(n === null || n === undefined) return '';
+  const when = n === 0 ? 'today' : n === 1 ? 'yesterday' : `${n} days ago`;
+  return (d.age_from_posted ? 'Posted ' : 'First seen ') + when;
+}
+
+// Escaped details block: age, description excerpt, AI gaps.
+function detailsHtml(d){
+  const age = ageText(d);
+  const desc = excerpt(d.description);
+  const gaps = (d.llm_gaps || []).length
+    ? `<div class="dgaps"><div class="plabel">AI gaps</div><ul>${d.llm_gaps.map(g => `<li>${esc(g)}</li>`).join('')}</ul></div>`
+    : '';
+  return (age ? `<div class="dage">${esc(age)}</div>` : '')
+    + `<div class="ddesc">${desc ? esc(desc) : '<span class="muted">No description from this source.</span>'}</div>`
+    + gaps;
+}
+
+async function toggleDetails(btn){
+  const box = btn.parentElement.querySelector('.details'); if(!box) return;
+  const open = box.hidden;
+  box.hidden = !open;
+  btn.setAttribute('aria-expanded', String(open));
+  btn.textContent = open ? 'Hide details' : 'Details';
+  if(!open || box.dataset.loaded) return;
+  box.innerHTML = '<span class="muted">Loading…</span>';
+  try { box.innerHTML = detailsHtml(await fetchDetail(btn.dataset.details)); box.dataset.loaded = '1'; }
+  catch(e){ box.innerHTML = `<span class="muted">${esc(e.message)}</span>`; }
+}
+
 function cardHtml(j, ctx){
   const hasAi = j.llm_score !== null && j.llm_score !== undefined;
   const score = hasAi ? j.llm_score : j.keyword_score;
@@ -497,6 +563,8 @@ function cardHtml(j, ctx){
       <span class="pill">${esc(j.region)}</span><span class="pill">${esc(j.seniority)}</span>
       <span style="color:#6b7480">${esc(j.location)}</span>${moreLocations(j)}</div>
       ${reason}
+      <button class="dtoggle" data-details="${id}" aria-expanded="false">Details</button>
+      <div class="details" hidden></div>
     </div>
     <div class="cardactions">${actions}</div>
   </div>`;
@@ -505,6 +573,8 @@ function cardHtml(j, ctx){
 // One delegated listener per container instead of inline onclick handlers,
 // so job ids never get spliced into JS source.
 function onJobActionClick(e){
+  const t = e.target.closest('button[data-details]');
+  if(t){ toggleDetails(t); return; }
   const b = e.target.closest('button[data-act]');
   if(b) jobAction(b.dataset.id, b.dataset.act, e);
 }
@@ -712,7 +782,7 @@ async function saveNote(id, note){
 }
 
 // --- Swipe (Tinder) mode ---
-let swipeJobs = [], swipeIdx = 0, swipeHist = [];
+let swipeJobs = [], swipeIdx = 0, swipeHist = [], swipeAnimating = false;
 async function loadSwipe(){
   const d = await (await fetch('/api/jobs?limit=100&sort=best')).json();
   swipeJobs = d.jobs || []; swipeIdx = 0; swipeHist = [];
@@ -727,7 +797,7 @@ function swipeCardInner(j){
     <div class="swipetags"><span class="badge ${esc(j.tier)}">${esc(String(j.tier ?? '').replace('_',' '))}</span>
       <span class="pill">${esc(j.work_mode)}</span><span class="pill">${esc(j.region)}</span>
       <span class="pill">${esc(j.seniority)}</span><span class="pill">${esc(j.location)}</span>${moreLocations(j)}</div>
-    <div class="swipereason">${reason}</div>
+    <div class="swipereason">${reason}<div class="details" data-id="${esc(j.id)}"><span class="muted">Loading details…</span></div></div>
     <div class="swipelink"><a href="${esc(safeUrl(j.url))}" target="_blank" rel="noopener">View full posting →</a></div>`;
 }
 function renderSwipe(){
@@ -744,12 +814,22 @@ function renderSwipe(){
   c.innerHTML = swipeCardInner(cur) + '<div class="swipehint like">SAVE</div><div class="swipehint nope">PASS</div>';
   stack.appendChild(c);
   attachSwipeDrag(c);
+  stack.querySelectorAll('.details[data-id]').forEach(fillSwipeDetails);
+}
+async function fillSwipeDetails(box){
+  let html;
+  try { html = detailsHtml(await fetchDetail(box.dataset.id)); }
+  catch(e){ html = `<span class="muted">${esc(e.message)}</span>`; }
+  if(box.isConnected) box.innerHTML = html; // the card may have been swiped meanwhile
 }
 function attachSwipeDrag(card){
   let startX=0, startY=0, dx=0, dragging=false;
   const like = card.querySelector('.swipehint.like'), nope = card.querySelector('.swipehint.nope');
   card.addEventListener('pointerdown', e => {
     if(e.target.closest('a')) return;
+    // Grabbing the details scrollbar should scroll, not drag the card.
+    const sr = e.target.closest('.swipereason');
+    if(sr && e.offsetX > sr.clientWidth) return;
     dragging = true; startX = e.clientX; startY = e.clientY; dx = 0;
     card.style.transition = 'none';
     try{ card.setPointerCapture(e.pointerId); }catch(_){}
@@ -764,7 +844,7 @@ function attachSwipeDrag(card){
   });
   const end = () => {
     if(!dragging) return; dragging = false;
-    if(Math.abs(dx) > 60){
+    if(Math.abs(dx) > 60 && !swipeAnimating){
       swipeFly(card, dx>0 ? 'right' : 'left');
       commitSwipe(dx>0 ? 'saved' : 'dismissed');
     } else {
@@ -783,18 +863,21 @@ function swipeFly(card, dir){
 }
 function commitSwipe(status){
   const j = swipeJobs[swipeIdx]; if(!j) return;
+  swipeAnimating = true;
   swipeHist.push({ id: j.id, idx: swipeIdx, dir: status==='saved' ? 'right' : 'left' });
   fetch('/api/jobs/status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:j.id,status})});
   swipeIdx++;
-  setTimeout(renderSwipe, 300);
+  setTimeout(() => { swipeAnimating = false; renderSwipe(); }, 300);
 }
 function swipeCommit(status){
+  if(swipeAnimating) return; // one card at a time, even with fast key presses
   if(document.activeElement && document.activeElement.blur) document.activeElement.blur();
   const stack = $('swipeStack'); const card = stack && stack.querySelector('.swipecard:not(.behind)');
   if(card) swipeFly(card, status==='saved' ? 'right' : 'left');
   commitSwipe(status);
 }
 async function swipeUndo(){
+  if(swipeAnimating) return;
   if(document.activeElement && document.activeElement.blur) document.activeElement.blur();
   const last = swipeHist.pop(); if(!last) return;
   await fetch('/api/jobs/status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:last.id,status:'active'})});
@@ -814,6 +897,25 @@ async function swipeUndo(){
     }));
   }
 }
+
+function openSwipePosting(){
+  const j = swipeJobs[swipeIdx]; if(!j) return;
+  const url = safeUrl(j.url);
+  if(url !== '#') window.open(url, '_blank', 'noopener');
+}
+
+// Swipe keys: Left = pass, Right = save, U = undo, O = open posting.
+document.addEventListener('keydown', e => {
+  if(currentView !== 'swipe' || e.repeat || e.metaKey || e.ctrlKey || e.altKey) return;
+  if(e.target.closest && e.target.closest('input, textarea, select, [contenteditable]')) return;
+  const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+  if(k === 'ArrowLeft') swipeCommit('dismissed');
+  else if(k === 'ArrowRight') swipeCommit('saved');
+  else if(k === 'u') swipeUndo();
+  else if(k === 'o') openSwipePosting();
+  else return;
+  e.preventDefault();
+});
 
 function bar(label, val, max){
   const w = Math.max(2, (Number(val)/max)*100) || 2;

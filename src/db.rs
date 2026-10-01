@@ -888,6 +888,67 @@ fn row_to_jobrow(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
     })
 }
 
+/// One job with everything the card's details pane needs (`GET /api/jobs/:id`).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct JobDetail {
+    #[serde(flatten)]
+    pub row: JobRow,
+    pub description: String,
+    /// The LLM's gaps, split back out of the stored "; "-joined string.
+    pub llm_gaps: Vec<String>,
+    /// As the source gave it: ISO date, or epoch seconds/millis.
+    pub posted_date: Option<String>,
+    pub first_seen: String,
+    /// Whole days since `posted_date`, or since `first_seen` when the posted
+    /// date is missing or unparseable (`age_from_posted` says which).
+    pub age_days: Option<i64>,
+    pub age_from_posted: bool,
+}
+
+/// Load one job for the details view; `None` if the id isn't stored.
+pub fn job_detail(conn: &Connection, id: &str) -> Result<Option<JobDetail>> {
+    // posted_date shapes seen across sources: ISO-8601 (with or without time
+    // / zone), epoch seconds (Himalayas), epoch millis (Lever), sometimes with
+    // stray JSON quotes. julianday() is NULL for anything it can't read.
+    let row = conn
+        .query_row(
+            "SELECT id, company, title, location, source, url, tier, keyword_score,
+                    work_mode, region, seniority, llm_score, llm_reasoning, status, note, status_at,
+                    locations, description, llm_gaps, posted_date, first_seen,
+                    CAST(julianday('now') - CASE
+                        WHEN p IS NULL THEN NULL
+                        WHEN p NOT GLOB '*[^0-9]*' THEN julianday(
+                            CAST(p AS INTEGER) / (CASE WHEN CAST(p AS INTEGER) > 100000000000 THEN 1000 ELSE 1 END),
+                            'unixepoch')
+                        ELSE julianday(p) END AS INTEGER),
+                    CAST(julianday('now') - julianday(first_seen) AS INTEGER)
+             FROM (SELECT *, NULLIF(TRIM(posted_date, '\" '), '') AS p FROM jobs WHERE id = ?1)",
+            [id],
+            |r| {
+                let gaps: Option<String> = r.get(18)?;
+                let posted_age: Option<i64> = r.get(21)?;
+                let seen_age: Option<i64> = r.get(22)?;
+                Ok(JobDetail {
+                    row: row_to_jobrow(r)?,
+                    description: r.get(17)?,
+                    llm_gaps: gaps
+                        .unwrap_or_default()
+                        .split(';')
+                        .map(str::trim)
+                        .filter(|g| !g.is_empty())
+                        .map(String::from)
+                        .collect(),
+                    posted_date: r.get(19)?,
+                    first_seen: r.get(20)?,
+                    age_days: posted_age.or(seen_age).map(|d| d.max(0)),
+                    age_from_posted: posted_age.is_some(),
+                })
+            },
+        )
+        .optional()?;
+    Ok(row)
+}
+
 /// Filters for [`search_jobs`]. `tier`/`work_mode`/`region`/`seniority` are
 /// exact matches when `Some`; `q` matches title or company (case-insensitive
 /// substring). `hide_onsite` drops onsite jobs unless `work_mode` asks for them;
@@ -1390,5 +1451,45 @@ mod tests {
             new_keyword_digest_matches(&conn, 10).unwrap().into_iter().map(|j| j.title).collect();
         assert_eq!(titles, ["Platform Engineer", "Rust Engineer"]);
         assert_eq!(new_keyword_digest_matches(&conn, 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn job_detail_reads_description_gaps_and_age_from_any_date_shape() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let three_days = now - 3 * 86_400 - 60;
+        let add = |title: &str, posted: Option<String>| {
+            let j = Job::new("Splice", title, "Remote", title, "greenhouse", "Para one.\n\nPara two.", posted, "{}");
+            upsert_job(&conn, &j).unwrap();
+            j.id
+        };
+        let secs = add("Secs", Some(three_days.to_string()));
+        let millis = add("Millis", Some((three_days * 1000).to_string()));
+        let quoted = add("Quoted", Some(format!("\"{three_days}\"")));
+        let none = add("None", None);
+        let junk = add("Junk", Some("last Tuesday".into()));
+
+        for id in [&secs, &millis, &quoted] {
+            let d = job_detail(&conn, id).unwrap().unwrap();
+            assert_eq!((d.age_days, d.age_from_posted), (Some(3), true), "{:?}", d.posted_date);
+        }
+        // No usable posted date: fall back to first_seen (just now).
+        for id in [&none, &junk] {
+            let d = job_detail(&conn, id).unwrap().unwrap();
+            assert_eq!((d.age_days, d.age_from_posted), (Some(0), false));
+        }
+
+        conn.execute("UPDATE jobs SET posted_date = date('now', '-10 days') || 'T09:30:00Z' WHERE id = ?1", [&none])
+            .unwrap();
+        assert_eq!(job_detail(&conn, &none).unwrap().unwrap().age_days, Some(10));
+
+        set_llm_verdict(&conn, &secs, 70, "Good fit", "5y Go; ; Kubernetes ").unwrap();
+        let d = job_detail(&conn, &secs).unwrap().unwrap();
+        assert_eq!(d.llm_gaps, ["5y Go", "Kubernetes"]);
+        assert_eq!(d.description, "Para one.\n\nPara two.");
+        assert_eq!(d.row.title, "Secs");
+
+        assert!(job_detail(&conn, "nope").unwrap().is_none());
     }
 }
