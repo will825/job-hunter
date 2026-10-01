@@ -71,6 +71,16 @@ apply_now = 30
 strong    = 16
 maybe     = 6
 
+# AI re-rank (needs GROQ_API_KEY). Groq retires models now and then — run
+# `job_hunter doctor` to check this one is still available.
+[llm]
+enabled = true
+model   = "openai/gpt-oss-120b"
+# Fit-score (0-100) cutoffs for AI-reviewed jobs; only apply_now/strong are emailed.
+tier_apply_now = 80
+tier_strong    = 62
+tier_maybe     = 40
+
 [email]
 enabled = true
 # Resend's shared sandbox sender works out of the box; swap for your

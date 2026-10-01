@@ -93,6 +93,10 @@ pub struct Llm {
     pub model: String,
     /// Cap on LLM calls per scan, so cost/time stays bounded.
     pub max_jobs_per_run: i64,
+    /// Fit-score (0-100) thresholds that map an LLM verdict to a tier.
+    pub tier_apply_now: i64,
+    pub tier_strong: i64,
+    pub tier_maybe: i64,
 }
 
 impl Default for Llm {
@@ -102,6 +106,9 @@ impl Default for Llm {
             provider: "groq".to_string(),
             model: "openai/gpt-oss-120b".to_string(),
             max_jobs_per_run: 30,
+            tier_apply_now: 80,
+            tier_strong: 62,
+            tier_maybe: 40,
         }
     }
 }
@@ -219,6 +226,11 @@ pub fn load_or_create(path: &str) -> Result<Profile> {
             .with_context(|| format!("writing default profile to {path}"))?;
         println!("Created a starter profile at {path} — edit it to tune your matches.\n");
     }
+    load(path)
+}
+
+/// Load and parse the profile at `path` (it must already exist).
+pub fn load(path: &str) -> Result<Profile> {
     let text = std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
     let profile: Profile =
         toml::from_str(&text).with_context(|| format!("parsing {path} (check the TOML syntax)"))?;
@@ -329,6 +341,8 @@ pub struct ScoringModel {
     /// `onsite_mode = "hide"`: onsite jobs always tier as skip.
     pub hide_onsite: bool,
     pub tiers: Tiers,
+    /// Thresholds on the LLM fit score (from `[llm]`), used once a job has one.
+    pub llm_tiers: Tiers,
 }
 
 impl Profile {
@@ -380,6 +394,11 @@ impl Profile {
             desc_positive_cap: self.weights.desc_positive_cap,
             hide_onsite: self.preferences.onsite_mode == OnsiteMode::Hide,
             tiers: self.tiers,
+            llm_tiers: Tiers {
+                apply_now: self.llm.tier_apply_now,
+                strong: self.llm.tier_strong,
+                maybe: self.llm.tier_maybe,
+            },
         }
     }
 }
@@ -468,6 +487,11 @@ provider = "groq"                 # groq | none
 # current id from https://console.groq.com/docs/models
 model = "openai/gpt-oss-120b"
 max_jobs_per_run = 30             # cap LLM calls per scan
+# Fit-score (0-100) cutoffs for tiering AI-reviewed jobs. Only apply_now/strong
+# reach the digest; raise these to make it pickier.
+tier_apply_now = 80
+tier_strong = 62
+tier_maybe = 40
 
 # Optional "watch any careers page" feature (reads pages that aren't on a known
 # ATS, like Warner Bros / Shure / The Audio Programmer). Off by default; set

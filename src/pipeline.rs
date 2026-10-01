@@ -286,7 +286,8 @@ pub async fn rescore_llm_owned(
     if !cfg.is_ready() {
         return Ok(tally);
     }
-    let hide_onsite = profile.compile().hide_onsite;
+    let model = profile.compile();
+    let hide_onsite = model.hide_onsite;
     let candidates = {
         let conn = db::connect(db_path)?;
         db::top_for_rescore(&conn, cfg.max_jobs_per_run, hide_onsite)?
@@ -343,7 +344,7 @@ pub async fn rescore_llm_owned(
 
     // Tiers are derived from the fit scores, not the LLM's tier label.
     let conn = db::connect(db_path)?;
-    db::rederive_llm_tiers(&conn, hide_onsite)?;
+    db::rederive_llm_tiers(&conn, hide_onsite, model.llm_tiers)?;
     tally.tokens_est = cfg.tokens_used();
     progress(&format!("  LLM used ~{} prompt tokens this run (estimate).", tally.tokens_est));
     Ok(tally)
@@ -382,7 +383,7 @@ pub fn rescore_all(conn: &Connection, model: &ScoringModel) -> Result<RescoreSum
         enrich(job, model);
         db::set_enrichment(&tx, job)?;
     }
-    db::rederive_llm_tiers(&tx, model.hide_onsite)?;
+    db::rederive_llm_tiers(&tx, model.hide_onsite, model.llm_tiers)?;
     let after = db::tier_counts(&tx)?;
     tx.commit()?;
     Ok(RescoreSummary { jobs: jobs.len(), before, after })
@@ -394,11 +395,14 @@ pub const STALE_DAYS: i64 = 14;
 /// Run a complete scan: load sources (+ Adzuna + custom pages if enabled),
 /// fetch, store, and LLM-rerank. One code path shared by `cargo run` and the
 /// daily `digest`. Holds the DB connection across awaits (fine for the CLI).
+/// With `llm_skip`, the LLM step doesn't run and that reason becomes the run's
+/// `llm_error` (so a digest falls back to keyword matches with it in the banner).
 pub async fn full_scan(
     conn: &Connection,
     db_path: &str,
     client: &reqwest::Client,
     profile: &Profile,
+    llm_skip: Option<String>,
     mut progress: impl FnMut(&str),
 ) -> Result<ScanSummary> {
     let model = profile.compile();
@@ -424,7 +428,10 @@ pub async fn full_scan(
     }
 
     let mut tally = LlmTally::default();
-    if cfg.is_ready() {
+    if let Some(reason) = llm_skip.filter(|_| cfg.is_ready()) {
+        progress(&format!("(LLM skipped: {reason} — keyword scoring only)"));
+        tally.first_error = Some(reason);
+    } else if cfg.is_ready() {
         progress(&format!("LLM fit-scoring top matches ({})…", cfg.model));
         tally = rescore_llm_owned(db_path, profile, client, &mut progress).await?;
         progress(&format!("Re-scored {} job(s) with the LLM ({} failed).", tally.scored, tally.failed));
@@ -560,7 +567,7 @@ mod tests {
         db::upsert_job(&conn, &rust).unwrap();
         db::upsert_job(&conn, &judged).unwrap();
         db::set_llm_verdict(&conn, &judged.id, 50, "ok", "").unwrap();
-        db::rederive_llm_tiers(&conn, false).unwrap();
+        db::rederive_llm_tiers(&conn, false, old.llm_tiers).unwrap();
 
         let mut profile = Profile::default();
         profile.target_roles = vec!["Rust Engineer".into(), "Rust Developer".into()];

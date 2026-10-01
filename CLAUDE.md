@@ -24,12 +24,14 @@ Runs 24/7 on a Raspberry Pi (systemd service + 7 AM digest cron); see `schedulin
 4. **LLM re-rank** — `pipeline::rescore_llm_owned` (the one Send-safe path for CLI, digest, and
    web) has Groq score `db::top_for_rescore` candidates (one per `title_key`, no dismissed/applied/
    rejected, no onsite when hidden, recent first), 2 calls at a time (`llm_score`, reasoning, gaps);
-   `db::rederive_llm_tiers` sets tiers from fit scores. Skipped cleanly with no `GROQ_API_KEY`.
+   `db::rederive_llm_tiers` sets tiers from fit scores (thresholds: profile `[llm] tier_apply_now`/
+   `tier_strong`/`tier_maybe`, default 80/62/40). Skipped cleanly with no `GROQ_API_KEY`.
    Retries are short (≤20s per wait, ≤60s per call). A 429 for the daily quota (Retry-After
    over 60s, or "per day" in the body) is `llm::QuotaExhausted`: no retries, breaker trips at
    once, `llm_error` = "Groq daily quota used up". Estimated prompt tokens go in `last_run`.
-5. **Digest** — `job_hunter digest` emails new apply_now/strong matches via Resend, marks
-   `notified_at`. First run only baselines (meta key `digest_baselined`).
+5. **Digest** — `job_hunter digest` first runs `llm::check_model` (one tiny Groq request); if it
+   fails, the LLM step is skipped and the digest falls back to keyword matches with the reason in
+   the banner. Emails new apply_now/strong matches via Resend, marks `notified_at`. First run only baselines (meta key `digest_baselined`).
 
 CLI `scan`/`digest` use `pipeline::full_scan`. The web "Scan now" (`POST /api/scan`) returns 202
 and runs `server::run_web_scan` in a spawned task — the same steps with short-lived connections,
@@ -47,7 +49,7 @@ Watched companies, Digest email, Settings. It talks to the `/api/*` JSON routes 
 
 ## Module map
 
-- `src/main.rs` — CLI entry, `.env` loader, subcommands: (none)=scan, `serve`, `add <url>`, `list`, `remove <id>`, `digest`, `dedupe`, `rescore`.
+- `src/main.rs` — CLI entry, `.env` loader, subcommands: (none)=scan, `serve`, `add <url>`, `list`, `remove <id>`, `digest`, `dedupe`, `rescore`, `doctor` (setup checks; runs before `db::init`, never creates files).
 - `src/server.rs` — axum router + JSON API handlers; binds `0.0.0.0:8787`, no auth.
 - `src/scan_lock.rs` — cross-process scan lock file (create_new; takeover when holder pid is dead).
 - `src/pipeline.rs` — fetch/store/prune/rescore orchestration, `full_scan`, Adzuna source expansion.

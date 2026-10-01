@@ -9,6 +9,7 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::models::Job;
+use crate::profile::Tiers;
 
 /// One-time setup for the database at `path`: create the schema, apply
 /// additive migrations, and seed the default watchlist. Run once at startup
@@ -695,21 +696,22 @@ pub fn copy_llm_verdict_to_twins(conn: &Connection, id: &str) -> Result<usize> {
 
 /// Recompute tier from the LLM fit score for every AI-reviewed job. This is the
 /// single place tiering happens once a job has been scored — so tiers always
-/// reflect the real fit, not the LLM's inconsistent tier label. Thresholds are
-/// tuned so only genuinely strong matches reach apply_now/strong (and the
-/// digest); adjust them here to taste. With `hide_onsite` (profile
-/// `onsite_mode = "hide"`), onsite jobs stay "skip" whatever their fit score.
-pub fn rederive_llm_tiers(conn: &Connection, hide_onsite: bool) -> Result<()> {
+/// reflect the real fit, not the LLM's inconsistent tier label. `tiers` are
+/// the fit-score thresholds from profile `[llm]` (default 80/62/40, so only
+/// genuinely strong matches reach apply_now/strong and the digest). With
+/// `hide_onsite` (profile `onsite_mode = "hide"`), onsite jobs stay "skip"
+/// whatever their fit score.
+pub fn rederive_llm_tiers(conn: &Connection, hide_onsite: bool, tiers: Tiers) -> Result<()> {
     conn.execute(
         "UPDATE jobs SET tier = CASE
             WHEN ?1 AND work_mode = 'onsite' THEN 'skip'
-            WHEN llm_score >= 80 THEN 'apply_now'
-            WHEN llm_score >= 62 THEN 'strong'
-            WHEN llm_score >= 40 THEN 'maybe'
+            WHEN llm_score >= ?2 THEN 'apply_now'
+            WHEN llm_score >= ?3 THEN 'strong'
+            WHEN llm_score >= ?4 THEN 'maybe'
             ELSE 'skip'
          END
          WHERE llm_score IS NOT NULL",
-        [hide_onsite],
+        rusqlite::params![hide_onsite, tiers.apply_now, tiers.strong, tiers.maybe],
     )?;
     Ok(())
 }
@@ -1095,11 +1097,31 @@ mod tests {
             conn.query_row("SELECT tier FROM jobs WHERE id = ?1", [id], |r| r.get(0)).unwrap()
         };
 
-        rederive_llm_tiers(&conn, false).unwrap();
+        let llm_tiers = crate::profile::Profile::default().compile().llm_tiers;
+        rederive_llm_tiers(&conn, false, llm_tiers).unwrap();
         assert_eq!(tier(&onsite.id), "apply_now");
-        rederive_llm_tiers(&conn, true).unwrap();
+        rederive_llm_tiers(&conn, true, llm_tiers).unwrap();
         assert_eq!(tier(&onsite.id), "skip");
         assert_eq!(tier(&remote.id), "apply_now");
+    }
+
+    #[test]
+    fn llm_tiers_follow_the_given_thresholds() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let j = job("greenhouse", "Rust Engineer", "u1");
+        upsert_job(&conn, &j).unwrap();
+        set_llm_verdict(&conn, &j.id, 70, "good", "").unwrap();
+        let tier = || -> String {
+            conn.query_row("SELECT tier FROM jobs WHERE id = ?1", [&j.id], |r| r.get(0)).unwrap()
+        };
+
+        rederive_llm_tiers(&conn, false, Tiers { apply_now: 80, strong: 62, maybe: 40 }).unwrap();
+        assert_eq!(tier(), "strong");
+        rederive_llm_tiers(&conn, false, Tiers { apply_now: 70, strong: 50, maybe: 30 }).unwrap();
+        assert_eq!(tier(), "apply_now");
+        rederive_llm_tiers(&conn, false, Tiers { apply_now: 95, strong: 85, maybe: 75 }).unwrap();
+        assert_eq!(tier(), "skip");
     }
 
     fn located(company: &str, source: &str, title: &str, location: &str, url: &str) -> Job {

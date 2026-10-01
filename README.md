@@ -111,7 +111,15 @@ cp .env.example .env                 # add your API keys (all optional)
 cp profile.example.toml profile.toml # make it yours
 
 cargo build --release
+
+# Check the setup: keys present, profile parses, DB opens, Groq model is live
+./target/release/job_hunter doctor
 ```
+
+`doctor` prints one PASS/FAIL line per check (key values are never shown). If Groq
+has retired your configured model it says so — pick a current one from
+[console.groq.com/docs/models](https://console.groq.com/docs/models) and set `[llm] model`
+in `profile.toml`.
 
 ### Run the web dashboard
 ```bash
@@ -125,6 +133,7 @@ job_hunter            # scan all sources and score
 job_hunter add <url>  # watch a company (paste its careers URL)
 job_hunter list       # list watched sources
 job_hunter digest     # send the daily digest email
+job_hunter doctor     # diagnose keys, profile, DB, and the Groq model
 ```
 
 ### API keys (all optional — it degrades gracefully)

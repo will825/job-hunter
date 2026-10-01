@@ -247,7 +247,6 @@ async fn groq_json(
     system: &str,
     user: &str,
 ) -> Result<serde_json::Value> {
-    let key = cfg.api_key.as_ref().ok_or_else(|| anyhow!("no GROQ_API_KEY set"))?;
     let body = json!({
         "model": cfg.model,
         "temperature": 0,
@@ -257,6 +256,38 @@ async fn groq_json(
             { "role": "user", "content": user }
         ]
     });
+    let resp = groq_send(cfg, client, &body).await?;
+
+    let tokens = estimate_tokens(system, user);
+    let total = cfg.tokens_est.fetch_add(tokens, Ordering::Relaxed) + tokens;
+    eprintln!("LLM call ~{tokens} prompt tokens (run total ~{total})");
+
+    let v: serde_json::Value = resp.json().await.context("reading Groq response")?;
+    let content = v
+        .pointer("/choices/0/message/content")
+        .and_then(|c| c.as_str())
+        .ok_or_else(|| anyhow!("Groq response had no message content"))?;
+    parse_json_content(content)
+}
+
+/// Groq answered with a non-success status (after any retries).
+#[derive(Debug)]
+pub struct GroqStatus {
+    pub status: u16,
+    message: String,
+}
+
+impl std::fmt::Display for GroqStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for GroqStatus {}
+
+/// Send one chat-completion request to Groq, returning the successful response.
+async fn groq_send(cfg: &LlmConfig, client: &reqwest::Client, body: &serde_json::Value) -> Result<reqwest::Response> {
+    let key = cfg.api_key.as_ref().ok_or_else(|| anyhow!("no GROQ_API_KEY set"))?;
 
     // Retry transient rate limits (429) / 5xx with short backoff, so brief
     // free-tier throttling doesn't skip jobs. The daily quota fails fast with
@@ -264,18 +295,18 @@ async fn groq_json(
     // the scan lock for hours, while failing lets the breaker trip at once.
     let started = Instant::now();
     let mut attempt = 0u32;
-    let resp = loop {
+    loop {
         let sent = client
             .post(&cfg.api_url)
             .bearer_auth(key)
-            .json(&body)
+            .json(body)
             .send()
             .await;
         match sent {
             Ok(r) => {
                 let status = r.status();
                 if status.is_success() {
-                    break r;
+                    return Ok(r);
                 }
                 let retry_after = r
                     .headers()
@@ -300,7 +331,10 @@ async fn groq_json(
                         tokio::time::sleep(Duration::from_secs_f64(wait)).await;
                     }
                     None => {
-                        return Err(anyhow!("Groq returned {status}{after}: {}", snippet(&detail, 300)));
+                        return Err(anyhow::Error::new(GroqStatus {
+                            status: status.as_u16(),
+                            message: format!("Groq returned {status}{after}: {}", snippet(&detail, 300)),
+                        }));
                     }
                 }
             }
@@ -313,18 +347,36 @@ async fn groq_json(
                 None => return Err(anyhow::Error::new(e).context("calling Groq")),
             },
         }
-    };
+    }
+}
 
-    let tokens = estimate_tokens(system, user);
-    let total = cfg.tokens_est.fetch_add(tokens, Ordering::Relaxed) + tokens;
-    eprintln!("LLM call ~{tokens} prompt tokens (run total ~{total})");
+/// The message shown when Groq doesn't recognise the configured model.
+pub fn model_unavailable(model: &str) -> String {
+    format!(
+        "model {model} is not available — pick a current one from \
+         https://console.groq.com/docs/models and set [llm] model in profile.toml"
+    )
+}
 
-    let v: serde_json::Value = resp.json().await.context("reading Groq response")?;
-    let content = v
-        .pointer("/choices/0/message/content")
-        .and_then(|c| c.as_str())
-        .ok_or_else(|| anyhow!("Groq response had no message content"))?;
-    parse_json_content(content)
+/// Make one tiny Groq request with the configured model, to catch a retired
+/// model or bad key before a run depends on it. `Err` is a one-line,
+/// user-facing reason. Assumes `cfg.is_ready()`.
+pub async fn check_model(cfg: &LlmConfig, client: &reqwest::Client) -> std::result::Result<(), String> {
+    let body = json!({
+        "model": cfg.model,
+        "max_tokens": 16,
+        "messages": [{ "role": "user", "content": "Reply with OK." }]
+    });
+    match groq_send(cfg, client, &body).await {
+        Ok(_) => Ok(()),
+        Err(e) => Err(match e.downcast_ref::<GroqStatus>() {
+            // Groq answers 404 (model_not_found) for a retired model, 400 for
+            // an id it doesn't accept.
+            Some(s) if s.status == 404 || s.status == 400 => model_unavailable(&cfg.model),
+            Some(s) if s.status == 401 => "Groq rejected GROQ_API_KEY (401 Unauthorized)".to_string(),
+            _ => format!("{e:#}"),
+        }),
+    }
 }
 
 /// Retries allowed after the first Groq request.
@@ -481,6 +533,44 @@ mod tests {
         assert!(is_quota_exhausted(&err), "expected QuotaExhausted, got: {err:#}");
         assert!(started.elapsed() < Duration::from_secs(2), "must not sleep on a daily quota");
         assert_eq!(cfg.tokens_used(), 0, "a refused call uses no tokens");
+    }
+
+    #[tokio::test]
+    async fn retired_model_fails_the_check_with_a_fix() {
+        let body = r#"{"error":{"message":"The model `old-model` does not exist","code":"model_not_found"}}"#;
+        let resp: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_boxed_str(),
+        );
+        let mut cfg = LlmConfig::for_test(true, Some("test-key"));
+        cfg.model = "old-model".into();
+        cfg.api_url = one_shot_server(resp).await;
+        let err = check_model(&cfg, &reqwest::Client::new()).await.unwrap_err();
+        assert_eq!(
+            err,
+            "model old-model is not available — pick a current one from \
+             https://console.groq.com/docs/models and set [llm] model in profile.toml"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_check_passes_on_success() {
+        let body = r#"{"choices":[{"message":{"content":"OK"}}]}"#;
+        let resp: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_boxed_str(),
+        );
+        let mut cfg = LlmConfig::for_test(true, Some("test-key"));
+        cfg.api_url = one_shot_server(resp).await;
+        assert_eq!(check_model(&cfg, &reqwest::Client::new()).await, Ok(()));
     }
 
     #[test]

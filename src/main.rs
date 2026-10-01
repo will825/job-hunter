@@ -46,7 +46,7 @@ const WEB_PORT: u16 = 8787;
 const ENV_FILE: &str = ".env";
 
 /// Subcommands `main` dispatches; anything else is rejected before the DB is touched.
-const KNOWN_COMMANDS: &[&str] = &["serve", "add", "list", "remove", "digest", "dedupe", "rescore"];
+const KNOWN_COMMANDS: &[&str] = &["serve", "add", "list", "remove", "digest", "dedupe", "rescore", "doctor"];
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -64,8 +64,13 @@ async fn main() -> Result<()> {
     let command = args.first().map(String::as_str);
     if let Some(other) = command.filter(|c| !KNOWN_COMMANDS.contains(c)) {
         return Err(anyhow!(
-            "unknown command '{other}'. Use: (no args) | serve | add <url> | list | remove <id> | digest | dedupe | rescore"
+            "unknown command '{other}'. Use: (no args) | serve | add <url> | list | remove <id> | digest | dedupe | rescore | doctor"
         ));
+    }
+
+    // `doctor` diagnoses the setup, so it must not create or migrate anything.
+    if command == Some("doctor") {
+        return cmd_doctor(&client).await;
     }
 
     // Schema, migrations and seeding happen once here; every later connection
@@ -124,7 +129,7 @@ async fn cmd_scan(client: &reqwest::Client) -> Result<()> {
     }
 
     println!("Scanning...\n");
-    let summary = pipeline::full_scan(&conn, DB_PATH, client, &profile, |line| println!("  {line}")).await?;
+    let summary = pipeline::full_scan(&conn, DB_PATH, client, &profile, None, |line| println!("  {line}")).await?;
     record_last_run(&conn, "scan", &summary);
 
     println!("\nSummary");
@@ -174,6 +179,20 @@ async fn cmd_scan(client: &reqwest::Client) -> Result<()> {
 /// `digest`: the daily run — scan, then email only the NEW apply-now/strong
 /// matches since last time (marking them so they're never re-sent).
 async fn cmd_digest(client: &reqwest::Client) -> Result<()> {
+    // Check the configured Groq model first: if it's retired (or the key is
+    // bad), skip the LLM outright and send keyword matches with the reason in
+    // the banner, rather than spending the run on calls that all fail.
+    let profile = profile::load_or_create(PROFILE_PATH)?;
+    let cfg = llm::LlmConfig::from_profile(&profile);
+    let llm_skip = if cfg.is_ready() {
+        llm::check_model(&cfg, client).await.err()
+    } else {
+        None
+    };
+    if let Some(reason) = &llm_skip {
+        println!("Daily digest: Groq model check failed — {reason}. Skipping AI scoring.");
+    }
+
     // If a web scan is already down to AI scoring, its fetch is done and the DB
     // is fresh — don't wait on the LLM (which can be slow or out of quota); send
     // from what's stored so the email still goes out.
@@ -184,20 +203,19 @@ async fn cmd_digest(client: &reqwest::Client) -> Result<()> {
     )
     .await?;
     let conn = db::connect(DB_PATH)?;
-    let profile = profile::load_or_create(PROFILE_PATH)?;
     let ecfg = email::EmailConfig::from_profile(&profile);
 
     let (summary, from_db_only) = match lock {
         scan_lock::Acquired::Lock(_lock) => {
             println!("Daily digest: scanning…");
-            let summary = pipeline::full_scan(&conn, DB_PATH, client, &profile, |line| println!("  {line}")).await?;
+            let summary =
+                pipeline::full_scan(&conn, DB_PATH, client, &profile, llm_skip, |line| println!("  {line}")).await?;
             record_last_run(&conn, "digest", &summary);
             (summary, false)
         }
         scan_lock::Acquired::Skipped => {
             println!("Daily digest: a web scan is AI-scoring — skipping the fetch and sending from stored jobs.");
-            let cfg = llm::LlmConfig::from_profile(&profile);
-            let summary = pipeline::ScanSummary { llm_enabled: cfg.enabled, ..Default::default() };
+            let summary = pipeline::ScanSummary { llm_enabled: cfg.enabled, llm_error: llm_skip, ..Default::default() };
             (summary, true)
         }
     };
@@ -251,6 +269,85 @@ async fn cmd_digest(client: &reqwest::Client) -> Result<()> {
         println!("Subject: {subject}\n{text}");
         println!("(Set up [email] + EMAIL_APP_PASSWORD to have this emailed to you.)");
     }
+    Ok(())
+}
+
+/// `doctor`: check the setup — API keys present (values never printed),
+/// profile.toml parses, the DB opens, and Groq accepts the configured model.
+/// One PASS/FAIL/SKIP line per check; exits non-zero if anything failed.
+async fn cmd_doctor(client: &reqwest::Client) -> Result<()> {
+    let mut failed = 0;
+    let mut report = |ok: Option<bool>, what: &str| {
+        let tag = match ok {
+            Some(true) => "PASS",
+            Some(false) => {
+                failed += 1;
+                "FAIL"
+            }
+            None => "SKIP",
+        };
+        println!("{tag}  {what}");
+    };
+
+    // Profile first (quietly), since it says which keys are needed.
+    let parsed = if std::path::Path::new(PROFILE_PATH).exists() {
+        profile::load(PROFILE_PATH).map_err(|e| format!("{e:#}"))
+    } else {
+        Err(format!("{PROFILE_PATH} not found — copy profile.example.toml to {PROFILE_PATH}"))
+    };
+    let profile = parsed.as_ref().ok();
+    let enabled = |f: fn(&profile::Profile) -> bool| profile.map_or(true, f);
+
+    // Keys: only presence is checked. Each is needed only when its feature is on.
+    report(Some(std::path::Path::new(ENV_FILE).exists()), &format!("{ENV_FILE} file present"));
+    let is_set = |k: &str| std::env::var(k).is_ok_and(|v| !v.trim().is_empty());
+    let keys: [(&str, &str, bool); 4] = [
+        ("GROQ_API_KEY", "[llm]", enabled(|p| p.llm.enabled)),
+        ("ADZUNA_APP_ID", "[adzuna]", enabled(|p| p.adzuna.enabled)),
+        ("ADZUNA_APP_KEY", "[adzuna]", enabled(|p| p.adzuna.enabled)),
+        ("RESEND_API_KEY", "[email]", enabled(|p| p.email.enabled)),
+    ];
+    for (key, section, needed) in keys {
+        match (is_set(key), needed) {
+            (true, _) => report(Some(true), &format!("{key} is set")),
+            (false, true) => report(Some(false), &format!("{key} is missing ({section} is enabled)")),
+            (false, false) => report(None, &format!("{key} not set ({section} is off)")),
+        }
+    }
+
+    match &parsed {
+        Ok(_) => report(Some(true), &format!("{PROFILE_PATH} parses")),
+        Err(e) => report(Some(false), &format!("{PROFILE_PATH}: {e}")),
+    }
+
+    // Open read-only so a missing DB is reported, not created.
+    let db = rusqlite::Connection::open_with_flags(DB_PATH, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .and_then(|c| c.query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get::<_, i64>(0)));
+    match db {
+        Ok(n) => report(Some(true), &format!("{DB_PATH} opens ({n} jobs)")),
+        Err(e) => report(Some(false), &format!("{DB_PATH} won't open: {e}")),
+    }
+
+    match profile {
+        None => report(None, "Groq model check (profile.toml didn't load)"),
+        Some(p) => {
+            let cfg = llm::LlmConfig::from_profile(p);
+            if !cfg.is_ready() {
+                report(None, &format!("Groq model check ({})", cfg.why_not_ready()));
+            } else {
+                match llm::check_model(&cfg, client).await {
+                    Ok(()) => report(Some(true), &format!("Groq accepts model {}", cfg.model)),
+                    Err(e) => report(Some(false), &format!("Groq: {e}")),
+                }
+            }
+        }
+    }
+
+    if failed > 0 {
+        println!("\n{failed} check(s) failed.");
+        std::process::exit(1);
+    }
+    println!("\nAll checks passed.");
     Ok(())
 }
 
