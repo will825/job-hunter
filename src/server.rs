@@ -7,7 +7,7 @@
 //!   DELETE /api/companies/:id     remove a source
 //!   POST   /api/scan              start a full scan in the background (202; 409 if one is running)
 //!   GET    /api/scan/status       progress of the current/last web scan
-//!   GET    /api/jobs?...          ranked jobs with filters
+//!   GET    /api/jobs?...          ranked jobs with filters, paged ({jobs, total})
 //!   POST   /api/rescore           re-score stored jobs against the current profile
 //!
 //! If `JOBHUNTER_TOKEN` is set, every /api route requires it (header
@@ -519,7 +519,9 @@ async fn jobs(State(st): State<AppState>, Query(q): Query<HashMap<String, String
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
     let get = |k: &str| q.get(k).filter(|s| !s.is_empty()).map(|s| s.as_str());
-    let limit: i64 = get("limit").and_then(|s| s.parse().ok()).unwrap_or(200);
+    let limit: i64 = get("limit").and_then(|s| s.parse().ok()).unwrap_or(50).clamp(1, 200);
+    let offset: i64 = get("offset").and_then(|s| s.parse().ok()).unwrap_or(0).max(0);
+    let flag = |k: &str| matches!(get(k), Some("1" | "true"));
     // Home is a triage queue: it only shows jobs you HAVEN'T acted on yet, so
     // saving / applying / dismissing a card makes it leave Home ("Tinder for
     // jobs"). Saved/Applied views show only that status.
@@ -528,20 +530,20 @@ async fn jobs(State(st): State<AppState>, Query(q): Query<HashMap<String, String
         Some("applied") => (Some("applied"), &[]),
         _ => (None, &["dismissed", "applied", "saved"]),
     };
-    let sort = get("sort").unwrap_or("best");
-    match db::search_jobs(
-        &conn,
-        get("tier"),
-        get("work_mode"),
-        get("region"),
-        get("seniority"),
-        get("q"),
+    let filter = db::JobFilter {
+        tier: get("tier"),
+        work_mode: get("work_mode"),
+        region: get("region"),
+        seniority: get("seniority"),
+        q: get("q"),
         only_status,
         exclude_statuses,
-        sort,
-        limit,
-    ) {
-        Ok(rows) => Json(json!({ "jobs": rows })).into_response(),
+        hide_onsite: flag("hide_onsite"),
+        ai_only: flag("ai_only"),
+    };
+    let sort = get("sort").unwrap_or("best");
+    match db::search_jobs(&conn, &filter, sort, limit, offset) {
+        Ok((rows, total)) => Json(json!({ "jobs": rows, "total": total })).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }

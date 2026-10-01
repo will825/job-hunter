@@ -65,6 +65,8 @@ button:disabled{opacity:.5;cursor:default;box-shadow:none}
 .reason{color:#6b7280;font-size:13.5px;margin-top:7px;line-height:1.45}
 .controls{display:flex;gap:9px;flex-wrap:wrap;margin-bottom:14px}
 .controls #q{flex:1;min-width:160px}
+.controls .tgl{display:flex;align-items:center;gap:6px;font-size:13px;color:#4b5563;white-space:nowrap;cursor:pointer}
+.controls .tgl input{width:16px;height:16px;margin:0}
 .card{
   background:linear-gradient(150deg, rgba(255,255,255,.62), rgba(255,255,255,.38));
   backdrop-filter:blur(28px) saturate(165%);-webkit-backdrop-filter:blur(28px) saturate(165%);
@@ -208,15 +210,18 @@ button:disabled{opacity:.5;cursor:default;box-shadow:none}
       <h1 class="viewhead">Your matches</h1>
       <p class="viewsub">Jobs ranked to your profile — best first.</p>
       <div class="controls">
-        <input id="q" placeholder="Search title / company…" oninput="loadJobs()" />
+        <input id="q" placeholder="Search title / company…" />
         <select id="tier" onchange="loadJobs()"><option value="">All tiers</option><option value="apply_now">Apply now</option><option value="strong">Strong</option><option value="maybe">Maybe</option><option value="skip">Skip</option></select>
         <select id="work_mode" onchange="loadJobs()"><option value="">Any mode</option><option>remote</option><option>hybrid</option><option>onsite</option></select>
         <select id="region" onchange="loadJobs()"><option value="">Any region</option><option value="us">US</option><option value="uk">UK</option><option value="emea">EMEA</option><option value="apac">APAC</option><option value="canada">Canada</option><option value="latam">LATAM</option></select>
         <select id="seniority" onchange="loadJobs()"><option value="">Any level</option><option>junior</option><option>mid</option><option>senior</option><option>staff</option><option>lead</option></select>
         <select id="sort" onchange="loadJobs()"><option value="best">Sort: Best match</option><option value="newest">Sort: Newest</option><option value="company">Sort: Company A–Z</option></select>
+        <label class="tgl"><input type="checkbox" id="hideOnsite"> Hide onsite</label>
+        <label class="tgl"><input type="checkbox" id="aiOnly"> AI-reviewed only</label>
       </div>
       <div id="jobsCount" class="muted" style="margin-bottom:10px"></div>
       <div id="jobs"></div>
+      <div id="jobsMore" class="muted" style="width:100%;min-height:1px;text-align:center;padding:14px 0"></div>
     </section>
 
     <section id="view-swipe" class="view hidden">
@@ -520,6 +525,7 @@ async function jobAction(id, status, ev){
     // Fly the card: right = saved, left = dismissed, up = applied.
     const dir = status==='saved' ? 'right' : status==='applied' ? 'up' : 'left';
     lastUndo = { id, html, dir };
+    jobsTotal = Math.max(0, jobsTotal - 1);
     flyOut(card, dir, updateJobsCount);
     const verb = status==='saved' ? 'Saved' : status==='applied' ? 'Marked applied' : 'Dismissed';
     showToast(`${verb}: ${title}`, undoLast);
@@ -528,10 +534,14 @@ async function jobAction(id, status, ev){
   }
 }
 
+// Cards still in the result set (ones flying away after an action aren't).
+function shownCards(){ return document.querySelectorAll('#jobs .card:not(.leaving)'); }
+
 function updateJobsCount(){
-  const n = document.querySelectorAll('#jobs .card').length;
-  $('jobsCount').textContent = `${n} shown`;
-  if(n === 0) loadJobs();
+  const n = shownCards().length;
+  $('jobsCount').textContent = `${n.toLocaleString()} of ${jobsTotal.toLocaleString()}`;
+  $('jobsMore').textContent = n < jobsTotal ? (jobsLoading ? 'Loading…' : '') : (n ? 'That’s everything.' : '');
+  if(n === 0 && jobsTotal > 0) loadJobs();
 }
 
 function offscreen(dir){
@@ -541,6 +551,7 @@ function offscreen(dir){
 }
 
 function flyOut(card, dir, done){
+  card.classList.add('leaving');
   card.style.pointerEvents = 'none';
   card.style.zIndex = '5';
   card.style.transition = 'transform .55s cubic-bezier(.25,.6,.3,1), opacity .55s ease';
@@ -575,7 +586,9 @@ async function undoLast(){
   card.style.pointerEvents = ''; card.style.zIndex = '';
   card.style.opacity = '0';
   card.style.transform = offscreen(dir);
+  card.classList.remove('leaving');
   jobs.insertBefore(card, jobs.firstChild);
+  jobsTotal++;
   requestAnimationFrame(() => requestAnimationFrame(() => {
     card.style.transition = 'transform .55s cubic-bezier(.25,.7,.3,1), opacity .4s ease';
     card.style.transform = 'none'; card.style.opacity = '1';
@@ -583,16 +596,73 @@ async function undoLast(){
   updateJobsCount();
 }
 
-async function loadJobs(){
+// Home pages in 50 at a time; a sentinel below the list loads the next page
+// as it scrolls into view. jobsSeq drops responses from superseded queries.
+const PAGE = 50;
+let jobsTotal = 0, jobsLoading = false, jobsSeq = 0;
+
+function jobsQuery(offset){
   const p = new URLSearchParams();
-  for(const k of ['q','tier','work_mode','region','seniority','sort']){ const v=$(k).value; if(v) p.set(k,v); }
-  p.set('limit','300');
-  const r = await fetch('/api/jobs?'+p.toString()); const d = await r.json();
-  const list = d.jobs || [];
-  $('jobsCount').textContent = `${list.length} shown`;
-  $('jobs').innerHTML = list.map(j => cardHtml(j,'home')).join('')
-    || '<div class="muted">No matches yet — add companies and hit “Scan now”.</div>';
+  for(const k of ['q','tier','work_mode','region','seniority','sort']){ const v=$(k).value.trim(); if(v) p.set(k,v); }
+  if($('hideOnsite').checked) p.set('hide_onsite','1');
+  if($('aiOnly').checked) p.set('ai_only','1');
+  p.set('limit', PAGE); p.set('offset', offset);
+  return '/api/jobs?'+p.toString();
 }
+
+async function loadJobs(){
+  const seq = ++jobsSeq;
+  jobsLoading = true;
+  try {
+    const d = await (await fetch(jobsQuery(0))).json();
+    if(seq !== jobsSeq) return;
+    const list = d.jobs || [];
+    jobsTotal = d.total || 0;
+    $('jobs').innerHTML = list.map(j => cardHtml(j,'home')).join('')
+      || '<div class="muted">No matches — loosen the filters, or add companies and hit “Scan now”.</div>';
+  } finally {
+    if(seq === jobsSeq){ jobsLoading = false; updateJobsCount(); }
+  }
+}
+
+async function loadMoreJobs(){
+  if(jobsLoading || currentView !== 'home') return;
+  const offset = shownCards().length;
+  if(offset === 0 || offset >= jobsTotal) return;
+  const seq = jobsSeq;
+  jobsLoading = true; updateJobsCount();
+  try {
+    const d = await (await fetch(jobsQuery(offset))).json();
+    if(seq !== jobsSeq) return;
+    jobsTotal = d.total || 0;
+    // Skip any job already on screen (the list can shift between pages).
+    const have = new Set([...document.querySelectorAll('#jobs .card button[data-id]')].map(b => b.dataset.id));
+    const fresh = (d.jobs || []).filter(j => !have.has(j.id));
+    $('jobs').insertAdjacentHTML('beforeend', fresh.map(j => cardHtml(j,'home')).join(''));
+  } finally {
+    if(seq === jobsSeq){ jobsLoading = false; updateJobsCount(); }
+  }
+  // Still in view (short page / tall screen)? Keep going.
+  if(seq === jobsSeq) requestAnimationFrame(() => { if(sentinelVisible) loadMoreJobs(); });
+}
+
+let sentinelVisible = false;
+new IntersectionObserver(entries => {
+  sentinelVisible = entries.some(e => e.isIntersecting);
+  if(sentinelVisible) loadMoreJobs();
+}, { rootMargin: '400px' }).observe($('jobsMore'));
+
+let searchTimer;
+$('q').addEventListener('input', () => { clearTimeout(searchTimer); searchTimer = setTimeout(loadJobs, 300); });
+
+// "Hide onsite" defaults on and is remembered per browser.
+try { $('hideOnsite').checked = localStorage.getItem('jh_hide_onsite') !== '0'; }
+catch { $('hideOnsite').checked = true; }
+$('hideOnsite').addEventListener('change', () => {
+  try { localStorage.setItem('jh_hide_onsite', $('hideOnsite').checked ? '1' : '0'); } catch {}
+  loadJobs();
+});
+$('aiOnly').addEventListener('change', loadJobs);
 
 const STAGES = [
   {key:'saved', label:'Saved'},

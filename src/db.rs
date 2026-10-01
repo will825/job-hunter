@@ -116,6 +116,15 @@ fn migrate(conn: &Connection) -> Result<()> {
     // first run.
     backfill_title_keys(conn)?;
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_title_key ON jobs(title_key)", [])?;
+    // Indexes for the Home filters/sorts. Created here (not in init_schema) so
+    // they come after the columns they cover exist on upgraded databases.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+         CREATE INDEX IF NOT EXISTS idx_jobs_tier ON jobs(tier);
+         CREATE INDEX IF NOT EXISTS idx_jobs_work_mode ON jobs(work_mode);
+         CREATE INDEX IF NOT EXISTS idx_jobs_first_seen ON jobs(first_seen);
+         CREATE INDEX IF NOT EXISTS idx_jobs_llm_score ON jobs(llm_score);",
+    )?;
     Ok(())
 }
 
@@ -879,22 +888,33 @@ fn row_to_jobrow(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
     })
 }
 
-/// Search stored jobs with optional filters, best score first.
-/// `tier`/`work_mode`/`region`/`seniority` are exact matches when `Some`;
-/// `q` matches title or company (case-insensitive substring).
-#[allow(clippy::too_many_arguments)]
+/// Filters for [`search_jobs`]. `tier`/`work_mode`/`region`/`seniority` are
+/// exact matches when `Some`; `q` matches title or company (case-insensitive
+/// substring). `hide_onsite` drops onsite jobs unless `work_mode` asks for them;
+/// `ai_only` keeps only jobs the LLM has scored.
+#[derive(Debug, Default)]
+pub struct JobFilter<'a> {
+    pub tier: Option<&'a str>,
+    pub work_mode: Option<&'a str>,
+    pub region: Option<&'a str>,
+    pub seniority: Option<&'a str>,
+    pub q: Option<&'a str>,
+    pub only_status: Option<&'a str>,
+    pub exclude_statuses: &'a [&'a str],
+    pub hide_onsite: bool,
+    pub ai_only: bool,
+}
+
+/// Search stored jobs with optional filters, one page at a time.
+/// Returns the page plus the total number of matching jobs.
 pub fn search_jobs(
     conn: &Connection,
-    tier: Option<&str>,
-    work_mode: Option<&str>,
-    region: Option<&str>,
-    seniority: Option<&str>,
-    q: Option<&str>,
-    only_status: Option<&str>,
-    exclude_statuses: &[&str],
+    f: &JobFilter,
     sort: &str,
     limit: i64,
-) -> Result<Vec<JobRow>> {
+    offset: i64,
+) -> Result<(Vec<JobRow>, i64)> {
+    let JobFilter { tier, work_mode, region, seniority, q, only_status, exclude_statuses, hide_onsite, ai_only } = *f;
     // Build the WHERE clause with bound parameters (never string-interpolate q).
     let mut clauses: Vec<String> = Vec::new();
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -923,6 +943,13 @@ pub fn search_jobs(
         }
     }
 
+    if hide_onsite && work_mode.is_none() {
+        clauses.push("work_mode != 'onsite'".to_string());
+    }
+    if ai_only {
+        clauses.push("llm_score IS NOT NULL".to_string());
+    }
+
     let where_sql = if clauses.is_empty() { String::new() } else { format!("WHERE {}", clauses.join(" AND ")) };
     // `sort` is a fixed whitelist — never interpolate user text into SQL.
     let order_by = match sort {
@@ -936,16 +963,22 @@ pub fn search_jobs(
                 work_mode, region, seniority, llm_score, llm_reasoning, status, note, status_at,
                 locations
          FROM jobs {where_sql}
-         ORDER BY {order_by} LIMIT ?"
+         ORDER BY {order_by}, id LIMIT ? OFFSET ?"
     );
-    params.push(Box::new(limit));
 
+    let mut param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let total: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM jobs {where_sql}"),
+        param_refs.as_slice(),
+        |r| r.get(0),
+    )?;
+    param_refs.push(&limit);
+    param_refs.push(&offset);
     let mut stmt = conn.prepare(&sql)?;
-    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
     let rows = stmt
         .query_map(param_refs.as_slice(), row_to_jobrow)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+    Ok((rows, total))
 }
 
 /// The top jobs in a tier, best keyword score first — for the summary preview.
@@ -1237,6 +1270,41 @@ mod tests {
         assert_eq!(key.as_deref(), Some(crate::text::title_key("Saab", "Engineer").as_str()));
         assert_eq!(locations_of(&conn, "x"), vec!["Syracuse"]);
         migrate(&conn).unwrap();
+    }
+
+    #[test]
+    fn search_jobs_pages_and_filters() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        migrate(&conn).unwrap();
+        for i in 0..5 {
+            let mut j = Job::new("Co", &format!("Engineer {i}"), "Remote", &format!("u{i}"), "greenhouse", "d", None, "{}");
+            j.work_mode = if i == 0 { "onsite".into() } else { "remote".into() };
+            j.keyword_score = i;
+            upsert_job(&conn, &j).unwrap();
+        }
+        conn.execute("UPDATE jobs SET llm_score = 70 WHERE url IN ('u3', 'u4')", []).unwrap();
+
+        let all = JobFilter::default();
+        let (page1, total) = search_jobs(&conn, &all, "best", 2, 0).unwrap();
+        let (page2, _) = search_jobs(&conn, &all, "best", 2, 2).unwrap();
+        let (page3, _) = search_jobs(&conn, &all, "best", 2, 4).unwrap();
+        assert_eq!(total, 5);
+        assert_eq!((page1.len(), page2.len(), page3.len()), (2, 2, 1));
+        let mut ids: Vec<_> = page1.iter().chain(&page2).chain(&page3).map(|r| r.id.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 5, "pages must not overlap");
+
+        let no_onsite = JobFilter { hide_onsite: true, ..Default::default() };
+        assert_eq!(search_jobs(&conn, &no_onsite, "best", 50, 0).unwrap().1, 4);
+        // An explicit work_mode wins over hide_onsite.
+        let onsite = JobFilter { hide_onsite: true, work_mode: Some("onsite"), ..Default::default() };
+        assert_eq!(search_jobs(&conn, &onsite, "best", 50, 0).unwrap().1, 1);
+        let ai = JobFilter { ai_only: true, ..Default::default() };
+        let (rows, total) = search_jobs(&conn, &ai, "best", 50, 0).unwrap();
+        assert_eq!(total, 2);
+        assert!(rows.iter().all(|r| r.llm_score == Some(70)));
     }
 
     #[test]
