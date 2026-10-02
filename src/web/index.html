@@ -138,6 +138,7 @@ button:disabled{opacity:.5;cursor:default;box-shadow:none}
 .apply_now{background:rgba(52,199,89,.16);color:#1a8a4a}.strong{background:rgba(10,132,255,.14);color:#0a6fd0}
 .maybe{background:rgba(255,180,20,.2);color:#b5820a}.skip{background:rgba(120,130,145,.15);color:#6b7280}
 .pill{background:rgba(255,255,255,.6);border:1px solid rgba(255,255,255,.7);color:#5b6675;padding:3px 9px;border-radius:20px;font-size:11.5px}
+.pill.closed{background:rgba(196,65,12,.1);border-color:rgba(196,65,12,.3);color:#c4410c}
 .ai{background:rgba(52,199,89,.16) !important;color:#1a8a4a !important;border-color:transparent !important}
 .spin{display:inline-block;width:13px;height:13px;border:2px solid rgba(10,132,255,.3);border-top-color:#0a84ff;border-radius:50%;animation:s .7s linear infinite;vertical-align:-2px}
 @keyframes s{to{transform:rotate(360deg)}}
@@ -604,7 +605,8 @@ async function toggleDetails(btn){
 function cardHtml(j, ctx){
   const hasAi = j.llm_score !== null && j.llm_score !== undefined;
   const score = hasAi ? j.llm_score : j.keyword_score;
-  const aiTag = hasAi ? '<span class="pill ai">AI fit</span>' : '';
+  const aiTag = (hasAi ? '<span class="pill ai">AI fit</span>' : '')
+    + (j.closed_at ? ' <span class="pill closed">Posting closed</span>' : '');
   const reason = (hasAi && j.llm_reasoning) ? `<div class="reason">${esc(j.llm_reasoning)}</div>` : '';
   const saved = j.status === 'saved';
   const id = esc(j.id);
@@ -736,12 +738,14 @@ async function undoLast(){
 const PAGE = 50;
 let jobsTotal = 0, jobsLoading = false, jobsSeq = 0;
 
-function jobsQuery(offset){
+// Home's filters (hide onsite on by default, best match first) — Swipe uses
+// the same ones, so both show the same queue.
+function jobsQuery(offset, limit = PAGE){
   const p = new URLSearchParams();
   for(const k of ['q','tier','work_mode','region','seniority','sort']){ const v=$(k).value.trim(); if(v) p.set(k,v); }
   if($('hideOnsite').checked) p.set('hide_onsite','1');
   if($('aiOnly').checked) p.set('ai_only','1');
-  p.set('limit', PAGE); p.set('offset', offset);
+  p.set('limit', limit); p.set('offset', offset);
   return '/api/jobs?'+p.toString();
 }
 
@@ -828,7 +832,7 @@ function trackerCard(j){
       <a href="${esc(safeUrl(j.url))}" target="_blank" rel="noopener" class="minititle">${esc(j.title)}</a>
       <button class="act x mini" data-id="${id}" data-act="active" title="Remove from tracker">×</button>
     </div>
-    <div class="minico">${esc(j.company)}</div>
+    <div class="minico">${esc(j.company)}${j.closed_at ? ' <span class="pill closed" title="The posting is no longer up">Posting closed</span>' : ''}</div>
     <input class="mininote" placeholder="Add a note…" value="${esc(j.note)}" data-id="${id}">
     <select class="ministage" data-id="${id}">${opts}</select>
   </div>`;
@@ -849,7 +853,7 @@ async function saveNote(id, note){
 // --- Swipe (Tinder) mode ---
 let swipeJobs = [], swipeIdx = 0, swipeHist = [], swipeAnimating = false;
 async function loadSwipe(){
-  const d = await (await fetch('/api/jobs?limit=100&sort=best')).json();
+  const d = await (await fetch(jobsQuery(0, 100))).json();
   swipeJobs = d.jobs || []; swipeIdx = 0; swipeHist = [];
   renderSwipe();
 }

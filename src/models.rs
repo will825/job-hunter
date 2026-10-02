@@ -31,6 +31,9 @@ pub struct Job {
     /// with the same `dedup_key` are the same logical job even across sources.
     /// See [`crate::text::dedup_key`].
     pub dedup_key: String,
+    /// The watched board this came from (its source label, e.g.
+    /// "greenhouse:splice"), set by the store step. Empty if unknown.
+    pub board: String,
 
     // --- Enrichment (filled by the scoring/classification pass, not fetchers) ---
     /// remote | hybrid | onsite | unknown. See [`crate::classify`].
@@ -79,6 +82,7 @@ impl Job {
             posted_date,
             raw_json: raw_json.into(),
             dedup_key,
+            board: String::new(),
             // Defaults; the enrichment pass overwrites these before storage.
             work_mode: "unknown".to_string(),
             region: "unknown".to_string(),

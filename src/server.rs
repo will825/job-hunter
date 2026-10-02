@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::scan_lock::ScanLock;
-use crate::{db, detect, llm, pipeline, profile};
+use crate::{db, detect, liveness, llm, pipeline, profile};
 
 #[derive(Clone)]
 struct AppState {
@@ -414,6 +414,16 @@ async fn run_web_scan(st: AppState, lock: Arc<ScanLock>) -> anyhow::Result<serde
     if let Err(e) = pipeline::record_last_run(&conn, "web", &summary) {
         eprintln!("couldn't record last_run: {e:#}");
     }
+    drop(conn);
+
+    // 5. In the background: check the top postings Home shows are still up.
+    let (db_path, client) = (st.db_path.clone(), st.client.clone());
+    tokio::spawn(async move {
+        match liveness::run_pass(&db_path, &client).await {
+            Ok(p) => eprintln!("liveness: checked {}, closed {}, inconclusive {}", p.checked, p.closed, p.unknown),
+            Err(e) => eprintln!("liveness pass failed: {e:#}"),
+        }
+    });
     Ok(pipeline::summary_json("web", &summary))
 }
 
@@ -649,7 +659,7 @@ async fn jobs(State(st): State<AppState>, Query(q): Query<HashMap<String, String
     let (only_status, exclude_statuses): (Option<&str>, &[&str]) = match get("view") {
         Some("saved") => (Some("saved"), &[]),
         Some("applied") => (Some("applied"), &[]),
-        _ => (None, &["dismissed", "applied", "saved"]),
+        _ => (None, db::HOME_HIDDEN_STATUSES),
     };
     let filter = db::JobFilter {
         tier: get("tier"),
@@ -661,6 +671,8 @@ async fn jobs(State(st): State<AppState>, Query(q): Query<HashMap<String, String
         exclude_statuses,
         hide_onsite: flag("hide_onsite"),
         ai_only: flag("ai_only"),
+        // Triage hides closed postings; the saved/applied lists keep them.
+        include_closed: only_status.is_some(),
     };
     let sort = get("sort").unwrap_or("best");
     match db::search_jobs(&conn, &filter, sort, limit, offset) {

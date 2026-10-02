@@ -25,6 +25,35 @@ pub fn html_to_text(input: &str) -> String {
     collapse_whitespace(&decoded_again)
 }
 
+/// The visible text of a whole HTML page: like [`html_to_text`], but first
+/// drops `<script>`, `<style>`, `<noscript>` and `<template>` blocks, whose
+/// contents (bundled UI strings, JSON) aren't what the page says.
+pub fn page_text(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let mut out = String::with_capacity(html.len());
+    let mut i = 0;
+    'outer: while i < html.len() {
+        for tag in ["script", "style", "noscript", "template"] {
+            let open = format!("<{tag}");
+            if lower[i..].starts_with(&open) {
+                let close = format!("</{tag}");
+                match lower[i..].find(&close) {
+                    Some(end) => {
+                        let after = i + end;
+                        i = lower[after..].find('>').map_or(html.len(), |gt| after + gt + 1);
+                    }
+                    None => i = html.len(),
+                }
+                continue 'outer;
+            }
+        }
+        let ch = html[i..].chars().next().unwrap_or(' ');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    html_to_text(&out)
+}
+
 /// Remove HTML tags, turning block-level tags into newlines so paragraph and
 /// list structure survives as line breaks. Does not touch entities.
 fn strip_tags(input: &str) -> String {
@@ -260,6 +289,15 @@ pub fn title_key(company: &str, title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_text_drops_scripts_and_styles() {
+        let html = "<html><head><style>p{}</style><SCRIPT>t('This job is no longer available')</SCRIPT></head>\
+                    <body><p>Senior Engineer</p><noscript>enable JS</noscript>é</body></html>";
+        let text = page_text(html);
+        assert!(text.contains("Senior Engineer") && text.contains('é'));
+        assert!(!text.contains("no longer available") && !text.contains("enable JS") && !text.contains("p{}"));
+    }
 
     #[test]
     fn company_from_token_title_cases_words() {

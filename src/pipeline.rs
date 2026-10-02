@@ -35,6 +35,7 @@ pub struct CustomCtx<'a> {
 /// The outcome of fetching one board.
 pub struct BoardFetch {
     pub label: String,
+    pub source: Source,
     pub result: Result<Vec<Job>>,
 }
 
@@ -56,6 +57,9 @@ pub struct ScanSummary {
     pub boards_failed: usize,
     /// Stale postings removed by this run's prune step.
     pub pruned: usize,
+    /// Postings closed by the store step: missing from their ATS board's
+    /// listing, or aggregator jobs unseen/too old.
+    pub closed: usize,
     /// `[llm] enabled` in the profile (independent of whether a key is set).
     pub llm_enabled: bool,
     pub llm_scored: usize,
@@ -222,6 +226,7 @@ pub fn summary_json(trigger: &str, s: &ScanSummary) -> serde_json::Value {
         "merged": s.merged,
         "store_failed": s.store_failed,
         "pruned": s.pruned,
+        "closed": s.closed,
         "total_in_db": s.total_in_db,
         "llm_enabled": s.llm_enabled,
         "llm_scored": s.llm_scored,
@@ -260,7 +265,7 @@ pub async fn fetch_all(
             Ok(jobs) => progress(&format!("✓ {:<24} {} job(s)", source.label(), jobs.len())),
             Err(e) => progress(&format!("✗ {:<24} {e}", source.label())),
         }
-        out.push(BoardFetch { label: source.label(), result });
+        out.push(BoardFetch { label: source.label(), source: source.clone(), result });
     }
     out
 }
@@ -272,12 +277,16 @@ pub async fn fetch_all(
 pub fn store_all(conn: &Connection, model: &ScoringModel, fetched: Vec<BoardFetch>) -> Result<ScanSummary> {
     let mut s = ScanSummary { boards_scanned: fetched.len(), ..Default::default() };
     let tx = conn.unchecked_transaction()?;
+    // Every job stored below gets a last_seen at or after this, so a board's
+    // rows still older than it weren't in that board's listing.
+    let since: String = tx.query_row("SELECT datetime('now')", [], |r| r.get(0))?;
     for board in fetched {
         match board.result {
             Ok(mut jobs) => {
                 s.total_fetched += jobs.len();
-                s.per_board.push((board.label, jobs.len()));
+                let mut store_failed = false;
                 for job in &mut jobs {
+                    job.board = board.label.clone();
                     enrich(job, model);
                     match db::upsert_job(&tx, job) {
                         Ok(Upsert::Inserted) => s.inserted += 1,
@@ -285,14 +294,28 @@ pub fn store_all(conn: &Connection, model: &ScoringModel, fetched: Vec<BoardFetc
                         Ok(Upsert::MergedDuplicate) => s.merged += 1,
                         Err(e) => {
                             s.store_failed += 1;
+                            store_failed = true;
                             eprintln!("couldn't store {} — {}: {e:#}", job.company, job.title);
                         }
                     }
                 }
+                // A complete ATS listing: whatever it no longer lists has
+                // closed. Skipped if a job failed to store (it'd look missing).
+                if board.source.is_ats() && !store_failed {
+                    let token = board.source.token();
+                    let mut names: Vec<String> = jobs.iter().map(|j| j.company.clone()).collect();
+                    names.push(token.to_string());
+                    names.push(crate::text::company_from_token(token));
+                    names.sort();
+                    names.dedup();
+                    s.closed += db::close_missing_from_board(&tx, board.source.ats(), &board.label, &since, &names)?;
+                }
+                s.per_board.push((board.label, jobs.len()));
             }
             Err(e) => s.failures.push((board.label, e.to_string())),
         }
     }
+    s.closed += db::close_stale_aggregators(&tx, AGGREGATOR_UNSEEN_DAYS, AGGREGATOR_MAX_AGE_DAYS)?;
     tx.commit()?;
     s.boards_failed = s.failures.len();
     s.total_in_db = db::count_jobs(conn)?;
@@ -430,9 +453,13 @@ pub fn rescore_all(conn: &Connection, model: &ScoringModel) -> Result<RescoreSum
 
 /// How long a posting can go unseen by scans before it's pruned as expired.
 pub const STALE_DAYS: i64 = 14;
+/// Aggregator jobs not seen by a scan for this long are closed.
+pub const AGGREGATOR_UNSEEN_DAYS: i64 = 3;
+/// Aggregator jobs posted longer ago than this are closed.
+pub const AGGREGATOR_MAX_AGE_DAYS: i64 = 30;
 
 /// Run a complete scan: load sources (+ Adzuna + custom pages if enabled),
-/// fetch, store, and LLM-rerank. One code path shared by `cargo run` and the
+/// fetch, store, LLM-rerank, then a liveness pass over Home's top jobs. One code path shared by `cargo run` and the
 /// daily `digest`. Holds the DB connection across awaits (fine for the CLI).
 /// With `llm_skip`, the LLM step doesn't run and that reason becomes the run's
 /// `llm_error` (so a digest falls back to keyword matches with it in the banner).
@@ -478,6 +505,15 @@ pub async fn full_scan(
         progress(&format!("(LLM off: {} — keyword scoring only)", cfg.why_not_ready()));
     }
     summary.set_llm(&cfg, &tally);
+
+    progress(&format!("Checking the top {} postings are still up…", crate::liveness::TOP_N));
+    match crate::liveness::run_pass(db_path, client).await {
+        Ok(p) => progress(&format!(
+            "Checked {} posting(s): {} closed, {} inconclusive.",
+            p.checked, p.closed, p.unknown
+        )),
+        Err(e) => progress(&format!("(Liveness check failed: {e:#})")),
+    }
     Ok(summary)
 }
 
@@ -559,6 +595,128 @@ mod tests {
         record_last_run(&conn, "web", &failing(&["ashby:suno"])).unwrap();
         assert_eq!(stored()["prev_failed_boards"], serde_json::json!(["lever:spotify", "ashby:suno"]));
         assert_eq!(failed_boards(&stored()), ["ashby:suno"]);
+    }
+
+    fn board(source: Source, result: Result<Vec<Job>>) -> BoardFetch {
+        BoardFetch { label: source.label(), source, result }
+    }
+
+    fn ats_job(company: &str, title: &str, url: &str) -> Job {
+        Job::new(company, title, "Remote", url, "lever", "d", None, "{}")
+            .with_display_company(crate::text::company_from_token(company))
+    }
+
+    fn open_titles(conn: &Connection) -> Vec<String> {
+        conn.prepare("SELECT title FROM jobs WHERE closed_at IS NULL ORDER BY title").unwrap()
+            .query_map([], |r| r.get(0)).unwrap()
+            .collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    /// Pretend every stored job was last seen by an earlier scan.
+    fn age_last_seen(conn: &Connection) {
+        conn.execute("UPDATE jobs SET last_seen = datetime('now', '-1 hour')", []).unwrap();
+    }
+
+    #[test]
+    fn ats_jobs_missing_from_a_successful_fetch_are_closed() {
+        let conn = Connection::open_in_memory().unwrap();
+        db::init_schema(&conn).unwrap();
+        let model = Profile::default().compile();
+        let spotify = || Source::Lever("spotify".into());
+        let (a, b) = (ats_job("spotify", "Audio Engineer", "u-a"), ats_job("spotify", "Data Engineer", "u-b"));
+        let other = ats_job("deepgram", "ML Engineer", "u-c");
+        store_all(&conn, &model, vec![
+            board(spotify(), Ok(vec![a.clone(), b.clone()])),
+            board(Source::Lever("deepgram".into()), Ok(vec![other])),
+        ]).unwrap();
+        // A row stored before `board` was recorded is matched by company.
+        conn.execute("UPDATE jobs SET board = NULL WHERE title = 'Data Engineer'", []).unwrap();
+        age_last_seen(&conn);
+
+        // A failed fetch closes nothing.
+        let s = store_all(&conn, &model, vec![board(spotify(), Err(anyhow::anyhow!("HTTP 500")))]).unwrap();
+        assert_eq!(s.closed, 0);
+        assert_eq!(open_titles(&conn).len(), 3);
+
+        // A successful fetch without Data Engineer closes just that one.
+        let s = store_all(&conn, &model, vec![board(spotify(), Ok(vec![a.clone()]))]).unwrap();
+        assert_eq!(s.closed, 1);
+        assert_eq!(open_titles(&conn), ["Audio Engineer", "ML Engineer"]);
+        let reason: String = conn.query_row("SELECT closed_reason FROM jobs WHERE title = 'Data Engineer'", [], |r| r.get(0)).unwrap();
+        assert_eq!(reason, "board");
+
+        // Listed again → open again.
+        age_last_seen(&conn);
+        store_all(&conn, &model, vec![board(spotify(), Ok(vec![a, b]))]).unwrap();
+        assert_eq!(open_titles(&conn).len(), 3);
+    }
+
+    #[test]
+    fn liveness_closures_survive_a_board_still_listing_the_job() {
+        let conn = Connection::open_in_memory().unwrap();
+        db::init_schema(&conn).unwrap();
+        let model = Profile::default().compile();
+        let a = ats_job("spotify", "Audio Engineer", "u-a");
+        store_all(&conn, &model, vec![board(Source::Lever("spotify".into()), Ok(vec![a.clone()]))]).unwrap();
+        assert!(db::record_check(&conn, &a.id, Some("check: HTTP 404")).unwrap());
+        store_all(&conn, &model, vec![board(Source::Lever("spotify".into()), Ok(vec![a]))]).unwrap();
+        assert!(open_titles(&conn).is_empty());
+    }
+
+    #[test]
+    fn aggregator_jobs_close_when_unseen_or_old() {
+        let conn = Connection::open_in_memory().unwrap();
+        db::init_schema(&conn).unwrap();
+        let model = Profile::default().compile();
+        let agg = |title: &str, url: &str, posted: Option<&str>| {
+            Job::new("Acme", title, "Remote", url, "remotive", "d", posted.map(String::from), "{}")
+        };
+        let days_ago = |d: i64| {
+            let t: String = conn.query_row(&format!("SELECT datetime('now', '-{d} days')"), [], |r| r.get(0)).unwrap();
+            t.replace(' ', "T") + "Z"
+        };
+        let millis_40_days_ago = ((std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+            - 40 * 86_400) * 1000).to_string();
+        let jobs = vec![
+            agg("Fresh", "u1", Some(&days_ago(2))),
+            agg("Old ISO", "u2", Some(&days_ago(31))),
+            agg("Old millis", "u3", Some(&millis_40_days_ago)),
+            agg("No date", "u4", None),
+            agg("Junk date", "u5", Some("last week")),
+        ];
+        let remotive = || Source::Remotive("software-dev".into());
+        let s = store_all(&conn, &model, vec![board(remotive(), Ok(jobs))]).unwrap();
+        assert_eq!(s.closed, 2, "posted over 30 days ago");
+        assert_eq!(open_titles(&conn), ["Fresh", "Junk date", "No date"]);
+
+        // Not seen for 2 days: still open. For 4 days: closed.
+        conn.execute("UPDATE jobs SET last_seen = datetime('now', '-2 days') WHERE title = 'Fresh'", []).unwrap();
+        conn.execute("UPDATE jobs SET last_seen = datetime('now', '-4 days') WHERE title = 'No date'", []).unwrap();
+        let s = store_all(&conn, &model, vec![board(remotive(), Err(anyhow::anyhow!("down")))]).unwrap();
+        assert_eq!(s.closed, 1);
+        assert_eq!(open_titles(&conn), ["Fresh", "Junk date"]);
+    }
+
+    #[test]
+    fn closed_jobs_are_left_out_of_home_digest_and_ai_candidates() {
+        let conn = Connection::open_in_memory().unwrap();
+        db::init_schema(&conn).unwrap();
+        let model = Profile::default().compile();
+        let (a, b) = (ats_job("spotify", "Audio Engineer", "u-a"), ats_job("spotify", "Data Engineer", "u-b"));
+        store_all(&conn, &model, vec![board(Source::Lever("spotify".into()), Ok(vec![a.clone(), b.clone()]))]).unwrap();
+        conn.execute("UPDATE jobs SET tier = 'strong', llm_score = NULL", []).unwrap();
+        db::set_job_status(&conn, &b.id, Some("saved")).unwrap();
+        db::record_check(&conn, &a.id, Some("check: HTTP 410")).unwrap();
+        db::record_check(&conn, &b.id, Some("check: HTTP 410")).unwrap();
+
+        let home = db::JobFilter { exclude_statuses: db::HOME_HIDDEN_STATUSES, ..Default::default() };
+        assert_eq!(db::search_jobs(&conn, &home, "best", 50, 0).unwrap().1, 0);
+        assert!(db::new_keyword_digest_matches(&conn, 10).unwrap().is_empty());
+        assert!(db::top_for_rescore(&conn, 10, false).unwrap().is_empty());
+        // The tracker still shows the saved one, marked closed.
+        let tracked = db::pipeline_jobs(&conn).unwrap();
+        assert_eq!(tracked.len(), 1);
+        assert!(tracked[0].closed_at.is_some());
     }
 
     #[test]

@@ -15,6 +15,7 @@
 //!   cargo run -- rescore           re-score every stored job against the current profile
 //!   cargo run -- dedupe            merge aggregator jobs stored once per city
 //!   cargo run -- compact           trim stored raw_json and VACUUM the database
+//!   cargo run -- liveness          check Home's top postings are still up (closes dead ones)
 //!   cargo run -- doctor            check keys, profile, DB, and the Groq model
 //!
 //! Robustness is deliberate: one board failing (bad token, network blip, API
@@ -26,6 +27,7 @@ mod db;
 mod detect;
 mod email;
 mod fetchers;
+mod liveness;
 mod llm;
 mod models;
 mod pipeline;
@@ -54,7 +56,7 @@ const ENV_FILE: &str = ".env";
 
 /// Subcommands `main` dispatches; anything else is rejected before the DB is touched.
 const KNOWN_COMMANDS: &[&str] =
-    &["serve", "add", "list", "remove", "digest", "dedupe", "rescore", "compact", "doctor"];
+    &["serve", "add", "list", "remove", "digest", "dedupe", "rescore", "compact", "liveness", "doctor"];
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -72,7 +74,7 @@ async fn main() -> Result<()> {
     let command = args.first().map(String::as_str);
     if let Some(other) = command.filter(|c| !KNOWN_COMMANDS.contains(c)) {
         return Err(anyhow!(
-            "unknown command '{other}'. Use: (no args) | serve | add <url> | list | remove <id> | digest | dedupe | rescore | compact | doctor"
+            "unknown command '{other}'. Use: (no args) | serve | add <url> | list | remove <id> | digest | dedupe | rescore | compact | liveness | doctor"
         ));
     }
 
@@ -103,6 +105,7 @@ async fn main() -> Result<()> {
         Some("dedupe") => cmd_dedupe().await,
         Some("rescore") => cmd_rescore().await,
         Some("compact") => cmd_compact().await,
+        Some("liveness") => cmd_liveness(&client).await,
         Some(other) => unreachable!("unknown command '{other}' rejected above"),
         None => cmd_scan(&client).await,
     }
@@ -148,6 +151,7 @@ async fn cmd_scan(client: &reqwest::Client) -> Result<()> {
     println!("  New this run:     {}", summary.inserted);
     println!("  Already seen:     {}", summary.already_seen);
     println!("  Duplicates merged:{}", summary.merged);
+    println!("  Postings closed:  {}", summary.closed);
     if summary.store_failed > 0 {
         println!("  Failed to store:  {}", summary.store_failed);
     }
@@ -274,6 +278,24 @@ async fn cmd_digest(client: &reqwest::Client) -> Result<()> {
             llm_failed: summary.llm_failed,
             from_db_only,
         },
+    };
+    // Last look before emailing: drop any whose posting has come down.
+    let jobs = if jobs.is_empty() {
+        jobs
+    } else {
+        let to_check = jobs.iter().map(|j| (j.id.clone(), j.url.clone())).collect();
+        match liveness::check_jobs(DB_PATH, client, to_check).await {
+            Ok((p, closed)) => {
+                if p.closed > 0 {
+                    println!("\nLeft out {} match(es) whose posting has closed.", p.closed);
+                }
+                jobs.into_iter().filter(|j| !closed.contains(&j.id)).collect()
+            }
+            Err(e) => {
+                eprintln!("warning: couldn't check the digest's postings: {e:#}");
+                jobs
+            }
+        }
     };
     if jobs.is_empty() {
         println!("\nNo new apply-now/strong matches since your last digest. Nothing to send.");
@@ -452,6 +474,15 @@ async fn cmd_compact() -> Result<()> {
     db::vacuum(&conn)?;
     drop(conn);
     println!("Database: {:.1} MB → {:.1} MB.", mb(before), mb(size()));
+    Ok(())
+}
+
+/// `liveness`: one liveness pass — fetch the URLs of the top open jobs Home
+/// shows (skipping any checked in the last day) and close the dead ones.
+async fn cmd_liveness(client: &reqwest::Client) -> Result<()> {
+    println!("Checking the top {} open postings…", liveness::TOP_N);
+    let p = liveness::run_pass(DB_PATH, client).await?;
+    println!("Checked {} posting(s): {} closed, {} inconclusive (left open).", p.checked, p.closed, p.unknown);
     Ok(())
 }
 

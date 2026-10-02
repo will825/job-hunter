@@ -29,7 +29,8 @@ So I built it. It now runs 24/7 on a Raspberry Pi and emails me a ranked shortli
 - Paste-a-careers-page detection: sniffs a custom page's HTML for an embedded ATS board
 - Optional LLM reader that turns an arbitrary careers page into structured jobs
 - Stable content-hash **deduplication** across all sources; aggregator postings re-listed once per city fold into one job with all its locations
-- Postings a board stops listing are pruned after 14 days (anything you've triaged is kept)
+- **Freshness:** a job missing from its company board's latest listing is closed at once; aggregator jobs close after 3 days unseen or 30 days since posting; and after each scan the top 150 jobs' links are checked (404s, redirects to a generic careers page, "no longer accepting applications"…). Closed jobs leave Home, Swipe, and the digest; the Tracker marks them "Posting closed"
+- Untriaged postings unseen for 14 days are pruned (anything you've triaged is kept)
 
 **Scoring**
 - **Stage 1 — keyword model:** a transparent weighted score over title + description (fast, runs on every job)
@@ -140,6 +141,7 @@ job_hunter digest        # scan, then email new matches (the 7 AM job)
 job_hunter rescore       # re-score every stored job against the current profile
 job_hunter dedupe        # merge aggregator jobs stored once per city into one row
 job_hunter compact       # trim stored raw API payloads and VACUUM the database
+job_hunter liveness      # check the top postings' links and close dead ones
 job_hunter doctor        # diagnose keys, profile, DB, and the Groq model
 ```
 

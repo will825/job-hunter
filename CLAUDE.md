@@ -15,6 +15,11 @@ Runs 24/7 on a Raspberry Pi (systemd service + 7 AM digest cron); see `schedulin
    Aggregator postings re-listed per city (same `title_key` = normalized company + title, seen in
    the last 30 days) merge into one row, appending to `locations` (JSON array). ATS rows never
    merge across locations. `job_hunter dedupe` collapses older per-city duplicates.
+   **Closing:** after a *successful* fetch of an ATS board (greenhouse/lever/ashby), its stored jobs
+   not refreshed by that fetch get `closed_at` (reason `board`; rows from before the `board` column
+   are matched by source + company). Aggregator jobs close when unseen for 3 days (`stale`) or
+   posted over 30 days ago (`old`). A job listed again reopens, unless a liveness check closed it.
+   Home, Swipe, the digest, and AI candidates exclude closed jobs; Tracker labels them "Posting closed".
    `job_hunter rescore` / `POST /api/rescore` (`pipeline::rescore_all`) re-run enrich on every
    stored job with the current profile in one transaction, then `rederive_llm_tiers`. Profile edits
    in the web UI (roles/skills/interests, resume upload) return at once and re-score in the
@@ -30,7 +35,12 @@ Runs 24/7 on a Raspberry Pi (systemd service + 7 AM digest cron); see `schedulin
    Retries are short (≤20s per wait, ≤60s per call). A 429 for the daily quota (Retry-After
    over 60s, or "per day" in the body) is `llm::QuotaExhausted`: no retries, breaker trips at
    once, `llm_error` = "Groq daily quota used up". Estimated prompt tokens go in `last_run`.
-5. **Digest** — `job_hunter digest` first runs `llm::check_model` (one tiny Groq request); if it
+5. **Liveness** — `liveness::run_pass` (after every scan: in-line for CLI scan/digest, spawned
+   for web; also `job_hunter liveness`) fetches the URLs of Home's top 150 open jobs (10s timeout,
+   3 at a time, skipping any with `last_checked_at` in the last 24h) and closes (`check: …`) on
+   404/410, a redirect to a generic careers/search page, or closed-posting text. Inconclusive
+   results leave the job open. The digest re-checks each job right before emailing it.
+6. **Digest** — `job_hunter digest` first runs `llm::check_model` (one tiny Groq request); if it
    fails (after one retry 2 min later if Groq was unreachable), the LLM step is skipped and the digest falls back to keyword matches with the reason in
    the banner. Emails new apply_now/strong matches via Resend, marks `notified_at`. First run only baselines (meta key `digest_baselined`).
 
@@ -50,7 +60,7 @@ Watched companies, Digest email, Settings. It talks to the `/api/*` JSON routes 
 
 ## Module map
 
-- `src/main.rs` — CLI entry, `.env` loader, subcommands: (none)=scan, `serve`, `add <url>`, `list`, `remove <id>`, `digest`, `dedupe`, `rescore`, `compact` (slim raw_json + VACUUM), `doctor` (setup checks; runs before `db::init`, never creates files).
+- `src/main.rs` — CLI entry, `.env` loader, subcommands: (none)=scan, `serve`, `add <url>`, `list`, `remove <id>`, `digest`, `dedupe`, `rescore`, `compact` (slim raw_json + VACUUM), `liveness` (one liveness pass), `doctor` (setup checks; runs before `db::init`, never creates files).
 - `src/server.rs` — axum router + JSON API handlers; binds `0.0.0.0:8787`; optional `JOBHUNTER_TOKEN` gates `/api/*` (X-Token header or `jh_token` cookie). `GET /` sends CSP + nosniff; the UI escapes all API data with `esc()`/`safeUrl()` and uses delegated listeners (no inline handlers with data).
 - `src/scan_lock.rs` — cross-process scan lock file (create_new; takeover when holder pid is dead).
 - `src/pipeline.rs` — fetch/store/prune/rescore orchestration, `full_scan`, Adzuna source expansion.
@@ -60,6 +70,7 @@ Watched companies, Digest email, Settings. It talks to the `/api/*` JSON routes 
 - `src/classify.rs` — heuristic work_mode / region / seniority; returns `unknown` rather than guess.
 - `src/score.rs` — Stage-1 transparent keyword score + `Tier` thresholds.
 - `src/profile.rs` — `profile.toml` load/create, `compile()` to `ScoringModel`, comment-preserving edits (toml_edit).
+- `src/liveness.rs` — post-scan URL liveness check (closed phrases, generic-redirect detection).
 - `src/llm.rs` — Groq client: `score_fit` (re-rank) and `extract_jobs` (custom pages). Isolated/removable.
 - `src/custom_page.rs` — optional LLM reader for arbitrary careers pages (`[custom_pages] enabled`).
 - `src/detect.rs` — pasted careers URL → validated `Source` (sniffs embedded ATS boards).

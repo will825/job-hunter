@@ -74,6 +74,12 @@ impl Source {
         Source::Adzuna { query: query.into(), country, results_per_page: results_per_page.clamp(1, 50) }
     }
 
+    /// A company's own ATS board (Greenhouse/Lever/Ashby), whose listing is
+    /// complete: a job missing from a successful fetch has closed.
+    pub fn is_ats(&self) -> bool {
+        matches!(self, Source::Greenhouse(_) | Source::Lever(_) | Source::Ashby(_))
+    }
+
     /// Whether this source needs the optional custom-page reader.
     pub fn is_custom(&self) -> bool {
         matches!(self, Source::CustomPage(_))

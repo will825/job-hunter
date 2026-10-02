@@ -94,6 +94,10 @@ fn migrate(conn: &Connection) -> Result<()> {
         ("locations", "TEXT"),
         ("title_key", "TEXT"),
         ("llm_scored_at", "TEXT"),
+        ("board", "TEXT"),
+        ("closed_at", "TEXT"),
+        ("closed_reason", "TEXT"),
+        ("last_checked_at", "TEXT"),
     ];
     for (col, decl) in wanted {
         if !existing.contains(*col) {
@@ -125,7 +129,9 @@ fn migrate(conn: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_jobs_tier ON jobs(tier);
          CREATE INDEX IF NOT EXISTS idx_jobs_work_mode ON jobs(work_mode);
          CREATE INDEX IF NOT EXISTS idx_jobs_first_seen ON jobs(first_seen);
-         CREATE INDEX IF NOT EXISTS idx_jobs_llm_score ON jobs(llm_score);",
+         CREATE INDEX IF NOT EXISTS idx_jobs_llm_score ON jobs(llm_score);
+         CREATE INDEX IF NOT EXISTS idx_jobs_board ON jobs(board);
+         CREATE INDEX IF NOT EXISTS idx_jobs_closed_at ON jobs(closed_at);",
     )?;
     Ok(())
 }
@@ -179,7 +185,11 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
             status_at    TEXT,
             locations    TEXT,             -- JSON array; >1 entry when merged across cities
             title_key    TEXT,             -- hash of normalized company + title (no location)
-            llm_scored_at TEXT             -- when the LLM last scored it (NULL = never/unknown)
+            llm_scored_at TEXT,            -- when the LLM last scored it (NULL = never/unknown)
+            board        TEXT,             -- source label of the board it came from, e.g. "lever:spotify"
+            closed_at    TEXT,             -- when the posting was found closed (NULL = open)
+            closed_reason TEXT,            -- why: "board" | "stale" | "old" | "check: ..."
+            last_checked_at TEXT           -- last liveness check of its URL
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedup_key ON jobs(dedup_key);
 
@@ -308,6 +318,7 @@ pub fn upsert_job(conn: &Connection, job: &Job) -> Result<Upsert> {
                 posted_date = ?5, raw_json = ?6,
                 work_mode = ?7, region = ?8, seniority = ?9,
                 keyword_score = ?10, tier = ?11, company = ?12,
+                board = COALESCE(NULLIF(?13, ''), board),
                 last_seen = datetime('now')
             WHERE id = ?1
             "#,
@@ -315,9 +326,10 @@ pub fn upsert_job(conn: &Connection, job: &Job) -> Result<Upsert> {
                 job.id, job.location, job.url, job.description,
                 job.posted_date, job.raw_json,
                 job.work_mode, job.region, job.seniority, job.keyword_score, job.tier,
-                job.company,
+                job.company, job.board,
             ],
         )?;
+        reopen(conn, "id = ?1", &job.id)?;
         return Ok(Upsert::AlreadySeen);
     }
 
@@ -347,16 +359,16 @@ pub fn upsert_job(conn: &Connection, job: &Job) -> Result<Upsert> {
                     (id, company, title, location, url, source, description,
                      posted_date, raw_json, dedup_key,
                      work_mode, region, seniority, keyword_score, tier, last_seen,
-                     locations, title_key)
+                     locations, title_key, board)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                         ?11, ?12, ?13, ?14, ?15, datetime('now'),
-                        json_array(?4), ?16)
+                        json_array(?4), ?16, NULLIF(?17, ''))
                 "#,
                 rusqlite::params![
                     job.id, job.company, job.title, job.location, job.url,
                     job.source, job.description, job.posted_date, job.raw_json, job.dedup_key,
                     job.work_mode, job.region, job.seniority, job.keyword_score, job.tier,
-                    title_key,
+                    title_key, job.board,
                 ],
             )?;
             Ok(Upsert::Inserted)
@@ -374,16 +386,17 @@ pub fn upsert_job(conn: &Connection, job: &Job) -> Result<Upsert> {
                         posted_date = ?9, raw_json = ?10,
                         work_mode = ?11, region = ?12, seniority = ?13,
                         keyword_score = ?14, tier = ?15,
-                        locations = json_array(?5), title_key = ?16
+                        locations = json_array(?5), title_key = ?16, board = NULLIF(?17, '')
                     WHERE dedup_key = ?1
                     "#,
                     rusqlite::params![
                         job.dedup_key, job.id, job.company, job.title, job.location,
                         job.url, job.source, job.description, job.posted_date, job.raw_json,
                         job.work_mode, job.region, job.seniority, job.keyword_score, job.tier,
-                        title_key,
+                        title_key, job.board,
                     ],
                 )?;
+                reopen(conn, "dedup_key = ?1", &job.dedup_key)?;
             }
             // Whether or not we replaced it, this posting appeared in this scan,
             // so it's still live — refresh last_seen (keeps it from being pruned).
@@ -443,6 +456,21 @@ fn add_location(conn: &Connection, id: &str, location: &str) -> Result<()> {
     conn.execute(
         "UPDATE jobs SET locations = ?2, last_seen = datetime('now') WHERE id = ?1",
         rusqlite::params![id, serde_json::to_string(&list)?],
+    )?;
+    reopen(conn, "id = ?1", id)?;
+    Ok(())
+}
+
+/// A posting that's listed again is open again — unless a liveness check
+/// closed it (its page says it's filled), which a board still listing it
+/// doesn't overrule. `cond` is a fixed WHERE clause with one `?1` param.
+fn reopen(conn: &Connection, cond: &str, val: &str) -> Result<()> {
+    conn.execute(
+        &format!(
+            "UPDATE jobs SET closed_at = NULL, closed_reason = NULL
+             WHERE {cond} AND closed_at IS NOT NULL AND closed_reason NOT LIKE 'check:%'"
+        ),
+        [val],
     )?;
     Ok(())
 }
@@ -526,6 +554,104 @@ pub fn prune_stale(conn: &Connection, max_age_days: i64) -> Result<usize> {
     Ok(n)
 }
 
+/// Julian day of a job's `posted_date` (NULL when missing/unreadable), for a
+/// row source exposing it as `p` = `NULLIF(TRIM(posted_date, '" '), '')`.
+/// Shapes seen across sources: ISO-8601 (with or without time / zone), epoch
+/// seconds (Himalayas), epoch millis (Lever), sometimes with stray JSON quotes.
+const POSTED_JULIANDAY: &str = "CASE
+    WHEN p IS NULL THEN NULL
+    WHEN p NOT GLOB '*[^0-9]*' THEN julianday(
+        CAST(p AS INTEGER) / (CASE WHEN CAST(p AS INTEGER) > 100000000000 THEN 1000 ELSE 1 END),
+        'unixepoch')
+    ELSE julianday(p) END";
+
+/// After a successful fetch of an ATS board, close every open job from that
+/// board the fetch didn't list: anything whose `last_seen` is older than
+/// `since` (the store step's start; every job just stored was refreshed past
+/// it). Rows stored before `board` was recorded are matched by source +
+/// company (`companies`: the names this board's jobs use). Returns how many
+/// were closed. Never call this for a board whose fetch failed.
+pub fn close_missing_from_board(
+    conn: &Connection,
+    ats: &str,
+    board: &str,
+    since: &str,
+    companies: &[String],
+) -> Result<usize> {
+    let names: Vec<String> = companies.iter().map(|c| c.to_lowercase()).collect();
+    let n = conn.execute(
+        "UPDATE jobs SET closed_at = datetime('now'), closed_reason = 'board'
+         WHERE closed_at IS NULL AND source = ?1 AND last_seen < ?3
+           AND (board = ?2
+                OR (board IS NULL AND LOWER(company) IN (SELECT value FROM json_each(?4))))",
+        rusqlite::params![ats, board, since, serde_json::to_string(&names)?],
+    )?;
+    Ok(n)
+}
+
+/// Close aggregator jobs that look expired: not seen by a scan in
+/// `unseen_days`, or posted more than `max_posted_days` ago. Returns how many
+/// were closed.
+pub fn close_stale_aggregators(conn: &Connection, unseen_days: i64, max_posted_days: i64) -> Result<usize> {
+    let unseen = conn.execute(
+        &format!(
+            "UPDATE jobs SET closed_at = datetime('now'), closed_reason = 'stale'
+             WHERE closed_at IS NULL AND source IN {AGGREGATORS_SQL}
+               AND last_seen < datetime('now', ?1)"
+        ),
+        [format!("-{} days", unseen_days.max(1))],
+    )?;
+    let old = conn.execute(
+        &format!(
+            "UPDATE jobs SET closed_at = datetime('now'), closed_reason = 'old'
+             WHERE id IN (
+                 SELECT id FROM (
+                     SELECT id, NULLIF(TRIM(posted_date, '\" '), '') AS p FROM jobs
+                     WHERE closed_at IS NULL AND source IN {AGGREGATORS_SQL}
+                 ) WHERE ({POSTED_JULIANDAY}) < julianday('now', ?1)
+             )"
+        ),
+        [format!("-{} days", max_posted_days.max(1))],
+    )?;
+    Ok(unseen + old)
+}
+
+/// Statuses Home (the triage queue) hides: jobs you've already acted on.
+pub const HOME_HIDDEN_STATUSES: &[&str] = &["dismissed", "applied", "saved"];
+
+/// The liveness pass's work list: Home's top `limit` open jobs with its
+/// default filters (onsite hidden, best match first), minus any checked in
+/// the last `recheck_hours`. Returns `(id, url)` pairs.
+pub fn liveness_candidates(conn: &Connection, limit: i64, recheck_hours: i64) -> Result<Vec<(String, String)>> {
+    let filter = JobFilter { exclude_statuses: HOME_HIDDEN_STATUSES, hide_onsite: true, ..Default::default() };
+    let (top, _) = search_jobs(conn, &filter, "best", limit, 0)?;
+    let cutoff = format!("-{} hours", recheck_hours.max(1));
+    let mut due = conn.prepare(
+        "SELECT 1 FROM jobs WHERE id = ?1
+           AND (last_checked_at IS NULL OR last_checked_at < datetime('now', ?2))",
+    )?;
+    let mut out = Vec::new();
+    for job in top {
+        if due.exists(rusqlite::params![job.id, cutoff])? {
+            out.push((job.id, job.url));
+        }
+    }
+    Ok(out)
+}
+
+/// Record a liveness check of a job: always stamps `last_checked_at`; with a
+/// `closed_reason` also closes it (if open). Returns whether it was closed now.
+pub fn record_check(conn: &Connection, id: &str, closed_reason: Option<&str>) -> Result<bool> {
+    conn.execute("UPDATE jobs SET last_checked_at = datetime('now') WHERE id = ?1", [id])?;
+    let Some(reason) = closed_reason else { return Ok(false) };
+    let n = conn.execute(
+        "UPDATE jobs SET closed_at = datetime('now'), closed_reason = ?2
+         WHERE id = ?1 AND closed_at IS NULL",
+        rusqlite::params![id, reason],
+    )?;
+    Ok(n > 0)
+}
+
 /// Jobs the LLM scored in the last `days` days (twins that inherited a
 /// verdict count too). Rows scored before `llm_scored_at` existed don't count.
 pub fn count_llm_scored_since(conn: &Connection, days: i64) -> Result<i64> {
@@ -579,6 +705,7 @@ pub fn new_digest_matches(conn: &Connection, limit: i64) -> Result<Vec<DigestJob
                 COALESCE(llm_score, keyword_score) AS score, llm_reasoning
          FROM jobs
          WHERE tier IN ('apply_now','strong') AND llm_score IS NOT NULL AND notified_at IS NULL
+           AND closed_at IS NULL
          ORDER BY (tier = 'apply_now') DESC, score DESC
          LIMIT ?1",
     )?;
@@ -595,6 +722,7 @@ pub fn new_keyword_digest_matches(conn: &Connection, limit: i64) -> Result<Vec<D
                 keyword_score AS score, llm_reasoning
          FROM jobs
          WHERE tier IN ('apply_now','strong') AND notified_at IS NULL AND work_mode != 'onsite'
+           AND closed_at IS NULL
          ORDER BY keyword_score DESC
          LIMIT ?1",
     )?;
@@ -650,8 +778,8 @@ pub struct RescoreCandidate {
     pub seniority: String,
 }
 
-/// The candidates for Stage-2 fit-scoring: keyword survivors (tier above skip)
-/// not yet LLM-scored, skipping jobs you've dismissed/applied to/been rejected
+/// The candidates for Stage-2 fit-scoring: open keyword survivors (tier above
+/// skip) not yet LLM-scored, skipping jobs you've dismissed/applied to/been rejected
 /// from and (with `hide_onsite`) onsite jobs. At most one job per normalized
 /// company + title (`title_key`), so a role listed in ten cities costs one call.
 /// Jobs first seen in the last 7 days come first, then best keyword score.
@@ -667,7 +795,7 @@ pub fn top_for_rescore(conn: &Connection, limit: i64, hide_onsite: bool) -> Resu
                                  keyword_score DESC, id
                     ) AS rn
              FROM jobs
-             WHERE tier != 'skip' AND llm_score IS NULL
+             WHERE tier != 'skip' AND llm_score IS NULL AND closed_at IS NULL
                AND COALESCE(status, '') NOT IN ('dismissed', 'applied', 'rejected')
                AND NOT (?2 AND work_mode = 'onsite')
          )
@@ -874,6 +1002,8 @@ pub struct JobRow {
     pub status_at: Option<String>,
     /// Every city this posting was listed in (always at least `location`).
     pub locations: Vec<String>,
+    /// When the posting was found closed (`None` = still open).
+    pub closed_at: Option<String>,
 }
 
 /// Set (or clear, with `None`) a job's status, recording when it changed.
@@ -900,21 +1030,24 @@ pub fn set_job_note(conn: &Connection, id: &str, note: &str) -> Result<bool> {
 /// All jobs currently in the application pipeline (any tracked stage), best
 /// score first — for the Tracker board.
 pub fn pipeline_jobs(conn: &Connection) -> Result<Vec<JobRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, company, title, location, source, url, tier, keyword_score,
-                work_mode, region, seniority, llm_score, llm_reasoning, status, note, status_at,
-                locations
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {JOBROW_COLUMNS}
          FROM jobs
          WHERE status IN ('saved','applied','interviewing','offer','rejected')
-         ORDER BY COALESCE(llm_score, keyword_score) DESC",
-    )?;
+         ORDER BY COALESCE(llm_score, keyword_score) DESC"
+    ))?;
     let rows = stmt
         .query_map([], row_to_jobrow)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
 
-/// Shared row → JobRow mapper for the 17-column job select.
+/// The columns [`row_to_jobrow`] reads, in order.
+const JOBROW_COLUMNS: &str = "id, company, title, location, source, url, tier, keyword_score,
+    work_mode, region, seniority, llm_score, llm_reasoning, status, note, status_at,
+    locations, closed_at";
+
+/// Shared row → JobRow mapper for a select starting with [`JOBROW_COLUMNS`].
 fn row_to_jobrow(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
     Ok(JobRow {
         id: r.get(0)?,
@@ -934,6 +1067,7 @@ fn row_to_jobrow(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
         note: r.get(14)?,
         status_at: r.get(15)?,
         locations: parse_locations(r.get::<_, Option<String>>(16)?.as_deref(), &r.get::<_, String>(3)?),
+        closed_at: r.get(17)?,
     })
 }
 
@@ -956,30 +1090,23 @@ pub struct JobDetail {
 
 /// Load one job for the details view; `None` if the id isn't stored.
 pub fn job_detail(conn: &Connection, id: &str) -> Result<Option<JobDetail>> {
-    // posted_date shapes seen across sources: ISO-8601 (with or without time
-    // / zone), epoch seconds (Himalayas), epoch millis (Lever), sometimes with
-    // stray JSON quotes. julianday() is NULL for anything it can't read.
     let row = conn
         .query_row(
-            "SELECT id, company, title, location, source, url, tier, keyword_score,
-                    work_mode, region, seniority, llm_score, llm_reasoning, status, note, status_at,
-                    locations, description, llm_gaps, posted_date, first_seen,
-                    CAST(julianday('now') - CASE
-                        WHEN p IS NULL THEN NULL
-                        WHEN p NOT GLOB '*[^0-9]*' THEN julianday(
-                            CAST(p AS INTEGER) / (CASE WHEN CAST(p AS INTEGER) > 100000000000 THEN 1000 ELSE 1 END),
-                            'unixepoch')
-                        ELSE julianday(p) END AS INTEGER),
-                    CAST(julianday('now') - julianday(first_seen) AS INTEGER)
-             FROM (SELECT *, NULLIF(TRIM(posted_date, '\" '), '') AS p FROM jobs WHERE id = ?1)",
+            &format!(
+                "SELECT {JOBROW_COLUMNS},
+                        description, llm_gaps, posted_date, first_seen,
+                        CAST(julianday('now') - ({POSTED_JULIANDAY}) AS INTEGER),
+                        CAST(julianday('now') - julianday(first_seen) AS INTEGER)
+                 FROM (SELECT *, NULLIF(TRIM(posted_date, '\" '), '') AS p FROM jobs WHERE id = ?1)"
+            ),
             [id],
             |r| {
-                let gaps: Option<String> = r.get(18)?;
-                let posted_age: Option<i64> = r.get(21)?;
-                let seen_age: Option<i64> = r.get(22)?;
+                let gaps: Option<String> = r.get(19)?;
+                let posted_age: Option<i64> = r.get(22)?;
+                let seen_age: Option<i64> = r.get(23)?;
                 Ok(JobDetail {
                     row: row_to_jobrow(r)?,
-                    description: r.get(17)?,
+                    description: r.get(18)?,
                     llm_gaps: gaps
                         .unwrap_or_default()
                         .split(';')
@@ -987,8 +1114,8 @@ pub fn job_detail(conn: &Connection, id: &str) -> Result<Option<JobDetail>> {
                         .filter(|g| !g.is_empty())
                         .map(String::from)
                         .collect(),
-                    posted_date: r.get(19)?,
-                    first_seen: r.get(20)?,
+                    posted_date: r.get(20)?,
+                    first_seen: r.get(21)?,
                     age_days: posted_age.or(seen_age).map(|d| d.max(0)),
                     age_from_posted: posted_age.is_some(),
                 })
@@ -1001,7 +1128,8 @@ pub fn job_detail(conn: &Connection, id: &str) -> Result<Option<JobDetail>> {
 /// Filters for [`search_jobs`]. `tier`/`work_mode`/`region`/`seniority` are
 /// exact matches when `Some`; `q` matches title or company (case-insensitive
 /// substring). `hide_onsite` drops onsite jobs unless `work_mode` asks for them;
-/// `ai_only` keeps only jobs the LLM has scored.
+/// `ai_only` keeps only jobs the LLM has scored. Closed postings are left out
+/// unless `include_closed`.
 #[derive(Debug, Default)]
 pub struct JobFilter<'a> {
     pub tier: Option<&'a str>,
@@ -1013,6 +1141,7 @@ pub struct JobFilter<'a> {
     pub exclude_statuses: &'a [&'a str],
     pub hide_onsite: bool,
     pub ai_only: bool,
+    pub include_closed: bool,
 }
 
 /// Search stored jobs with optional filters, one page at a time.
@@ -1024,7 +1153,9 @@ pub fn search_jobs(
     limit: i64,
     offset: i64,
 ) -> Result<(Vec<JobRow>, i64)> {
-    let JobFilter { tier, work_mode, region, seniority, q, only_status, exclude_statuses, hide_onsite, ai_only } = *f;
+    let JobFilter {
+        tier, work_mode, region, seniority, q, only_status, exclude_statuses, hide_onsite, ai_only, include_closed,
+    } = *f;
     // Build the WHERE clause with bound parameters (never string-interpolate q).
     let mut clauses: Vec<String> = Vec::new();
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -1059,6 +1190,9 @@ pub fn search_jobs(
     if ai_only {
         clauses.push("llm_score IS NOT NULL".to_string());
     }
+    if !include_closed {
+        clauses.push("closed_at IS NULL".to_string());
+    }
 
     let where_sql = if clauses.is_empty() { String::new() } else { format!("WHERE {}", clauses.join(" AND ")) };
     // `sort` is a fixed whitelist — never interpolate user text into SQL.
@@ -1069,9 +1203,7 @@ pub fn search_jobs(
         _ => "COALESCE(llm_score, -1) DESC, keyword_score DESC",
     };
     let sql = format!(
-        "SELECT id, company, title, location, source, url, tier, keyword_score,
-                work_mode, region, seniority, llm_score, llm_reasoning, status, note, status_at,
-                locations
+        "SELECT {JOBROW_COLUMNS}
          FROM jobs {where_sql}
          ORDER BY {order_by}, id LIMIT ? OFFSET ?"
     );
