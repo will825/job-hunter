@@ -358,6 +358,8 @@ pub async fn rescore_llm_owned(
 /// Classification runs first because scoring reads `work_mode`/`region`.
 pub fn enrich(job: &mut Job, model: &ScoringModel) {
     let cls = classify::classify(job);
+    // Classification is the only reader of raw_json: keep just what it uses.
+    job.raw_json = classify::slim_raw_json(&job.raw_json);
     job.work_mode = cls.work_mode;
     job.region = cls.region;
     job.seniority = cls.seniority;

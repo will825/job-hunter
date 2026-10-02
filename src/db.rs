@@ -784,6 +784,37 @@ pub fn tier_counts(conn: &Connection) -> Result<std::collections::BTreeMap<Strin
     Ok(rows)
 }
 
+/// Slim every stored job's `raw_json` to the fields classification reads
+/// (see [`crate::classify::slim_raw_json`]), in one transaction. Rows are
+/// streamed, and only changed ones are rewritten. Returns how many changed.
+pub fn compact_raw_json(conn: &Connection) -> Result<usize> {
+    let tx = conn.unchecked_transaction()?;
+    let mut changed: Vec<(String, String)> = Vec::new();
+    {
+        let mut stmt = tx.prepare("SELECT id, raw_json FROM jobs")?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let raw: String = r.get(1)?;
+            let slim = crate::classify::slim_raw_json(&raw);
+            if slim != raw {
+                changed.push((r.get(0)?, slim));
+            }
+        }
+    }
+    for (id, slim) in &changed {
+        tx.execute("UPDATE jobs SET raw_json = ?2 WHERE id = ?1", rusqlite::params![id, slim])?;
+    }
+    tx.commit()?;
+    Ok(changed.len())
+}
+
+/// Rebuild the database file to reclaim free pages (after [`compact_raw_json`]),
+/// then fold the WAL back in and truncate it.
+pub fn vacuum(conn: &Connection) -> Result<()> {
+    conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
+    Ok(())
+}
+
 /// Every stored job rebuilt as a [`Job`] from its stored fields, for
 /// re-running classification + keyword scoring without a re-fetch. The stored
 /// `id` is kept (not recomputed), so updates hit the right row.
@@ -1126,6 +1157,19 @@ mod tests {
             .query_map([], |r| r.get(0)).unwrap()
             .collect::<rusqlite::Result<_>>().unwrap();
         assert_eq!(names, ["Deepgram"]);
+    }
+
+    #[test]
+    fn compact_raw_json_keeps_only_classify_fields() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let big = r#"{"isRemote":true,"country":"US","descriptionHtml":"<p>long</p>","id":7}"#;
+        upsert_job(&conn, &Job::new("A", "Eng", "Remote", "u1", "ashby", "d", None, big)).unwrap();
+        upsert_job(&conn, &Job::new("B", "Eng", "Remote", "u2", "ashby", "d", None, "{}")).unwrap();
+        assert_eq!(compact_raw_json(&conn).unwrap(), 1);
+        assert_eq!(compact_raw_json(&conn).unwrap(), 0, "idempotent");
+        let raw: String = conn.query_row("SELECT raw_json FROM jobs WHERE company = 'A'", [], |r| r.get(0)).unwrap();
+        assert_eq!(raw, r#"{"country":"US","isRemote":true}"#);
     }
 
     #[test]

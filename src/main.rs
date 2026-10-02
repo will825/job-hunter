@@ -48,7 +48,8 @@ const DIGEST_CHECK_RETRY_WAIT: Duration = Duration::from_secs(2 * 60);
 const ENV_FILE: &str = ".env";
 
 /// Subcommands `main` dispatches; anything else is rejected before the DB is touched.
-const KNOWN_COMMANDS: &[&str] = &["serve", "add", "list", "remove", "digest", "dedupe", "rescore", "doctor"];
+const KNOWN_COMMANDS: &[&str] =
+    &["serve", "add", "list", "remove", "digest", "dedupe", "rescore", "compact", "doctor"];
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -66,7 +67,7 @@ async fn main() -> Result<()> {
     let command = args.first().map(String::as_str);
     if let Some(other) = command.filter(|c| !KNOWN_COMMANDS.contains(c)) {
         return Err(anyhow!(
-            "unknown command '{other}'. Use: (no args) | serve | add <url> | list | remove <id> | digest | dedupe | rescore | doctor"
+            "unknown command '{other}'. Use: (no args) | serve | add <url> | list | remove <id> | digest | dedupe | rescore | compact | doctor"
         ));
     }
 
@@ -96,6 +97,7 @@ async fn main() -> Result<()> {
         Some("digest") => cmd_digest(&client).await,
         Some("dedupe") => cmd_dedupe().await,
         Some("rescore") => cmd_rescore().await,
+        Some("compact") => cmd_compact().await,
         Some(other) => unreachable!("unknown command '{other}' rejected above"),
         None => cmd_scan(&client).await,
     }
@@ -419,6 +421,29 @@ async fn cmd_rescore() -> Result<()> {
         let count = |m: &std::collections::BTreeMap<String, i64>| m.get(tier).copied().unwrap_or(0);
         println!("  {:<10} {:>7} {:>7}", tier, count(&s.before), count(&s.after));
     }
+    Ok(())
+}
+
+/// `compact`: slim every stored job's raw_json to the fields classification
+/// reads (new jobs are stored that way already), then VACUUM to give the
+/// space back. Holds the scan lock so it can't race a scan's writes.
+async fn cmd_compact() -> Result<()> {
+    let _lock = scan_lock::ScanLock::acquire_waiting(SCAN_LOCK_PATH, SCAN_LOCK_WAIT).await?;
+    let size = || {
+        ["", "-wal"]
+            .iter()
+            .filter_map(|ext| std::fs::metadata(format!("{DB_PATH}{ext}")).ok())
+            .map(|m| m.len())
+            .sum::<u64>()
+    };
+    let mb = |b: u64| b as f64 / 1_048_576.0;
+    let before = size();
+    let conn = db::connect(DB_PATH)?;
+    let slimmed = db::compact_raw_json(&conn)?;
+    println!("Slimmed raw_json on {slimmed} job(s). Vacuuming…");
+    db::vacuum(&conn)?;
+    drop(conn);
+    println!("Database: {:.1} MB → {:.1} MB.", mb(before), mb(size()));
     Ok(())
 }
 

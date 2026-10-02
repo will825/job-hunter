@@ -23,8 +23,9 @@ pub struct Job {
     pub description: String,
     /// The ATS-provided posting date, if any (kept as the source's string form).
     pub posted_date: Option<String>,
-    /// The original API payload for this job, so we can re-score later
-    /// without re-fetching. Stored as a JSON string.
+    /// The original API payload for this job, as a JSON string. Enrichment
+    /// slims it to the fields classification reads before it's stored, so
+    /// jobs can be re-classified later without re-fetching.
     pub raw_json: String,
     /// Fuzzy identity key (normalized company+title+location). Two postings
     /// with the same `dedup_key` are the same logical job even across sources.

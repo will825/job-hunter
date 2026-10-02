@@ -31,6 +31,24 @@ pub fn classify(job: &Job) -> Classification {
     }
 }
 
+/// The only `raw_json` fields [`classify`] reads. Everything else in a
+/// board's payload is dropped before storage (see [`slim_raw_json`]).
+const RAW_KEYS: &[&str] = &["isRemote", "workplaceType", "country"];
+
+/// Cut a raw board payload down to the fields [`classify`] reads, so stored
+/// jobs don't carry the whole API response. Classifying the slim form gives
+/// the same result as the full one. Unparseable or non-object input → `{}`.
+pub fn slim_raw_json(raw: &str) -> String {
+    let Ok(Value::Object(full)) = serde_json::from_str::<Value>(raw) else {
+        return "{}".to_string();
+    };
+    let slim: serde_json::Map<String, Value> = RAW_KEYS
+        .iter()
+        .filter_map(|k| full.get(*k).map(|v| (k.to_string(), v.clone())))
+        .collect();
+    Value::Object(slim).to_string()
+}
+
 fn work_mode(job: &Job, raw: &Value) -> String {
     let loc = job.location.to_lowercase();
     let title = job.title.to_lowercase();
@@ -146,6 +164,17 @@ mod tests {
         // The elevenlabs case: location "India" but isRemote true → remote.
         let j = job_with("India", "Account Manager", r#"{"isRemote":true}"#);
         assert_eq!(classify(&j).work_mode, "remote");
+    }
+
+    #[test]
+    fn slim_raw_json_classifies_the_same() {
+        let full = r#"{"workplaceType":"OnSite","country":"United Kingdom","extra":{"big":[1,2,3]}}"#;
+        let slim = slim_raw_json(full);
+        assert_eq!(slim, r#"{"country":"United Kingdom","workplaceType":"OnSite"}"#);
+        let (a, b) = (classify(&job_with("Anywhere", "Eng", full)), classify(&job_with("Anywhere", "Eng", &slim)));
+        assert_eq!((a.work_mode, a.region), (b.work_mode, b.region));
+        assert_eq!(slim_raw_json("[1]"), "{}");
+        assert_eq!(slim_raw_json("not json"), "{}");
     }
 
     #[test]
