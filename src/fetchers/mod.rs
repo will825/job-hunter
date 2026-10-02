@@ -49,7 +49,9 @@ pub async fn fetch_source(source: &Source, client: &reqwest::Client) -> Result<V
         Source::Ashby(t) => AshbyFetcher::new(t.clone()).fetch(client).await,
         Source::Remotive(t) => RemotiveFetcher::new(t.clone()).fetch(client).await,
         Source::RemoteOk(t) => RemoteOkFetcher::new(t.clone()).fetch(client).await,
-        Source::Adzuna(q) => AdzunaFetcher::new(q.clone()).fetch(client).await,
+        Source::Adzuna { query, country, results_per_page } => {
+            AdzunaFetcher::new(query.clone(), country.clone(), *results_per_page).fetch(client).await
+        }
         Source::Himalayas(t) => HimalayasFetcher::new(t.clone()).fetch(client).await,
         Source::Jobicy(t) => JobicyFetcher::new(t.clone()).fetch(client).await,
         // Custom pages are handled by the custom-page reader, not here.

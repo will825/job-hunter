@@ -448,7 +448,9 @@ pub async fn full_scan(
 
 /// Build Adzuna search sources from the profile's target roles — one broad
 /// internet-wide search per role — when Adzuna is enabled and its credentials
-/// are present. Returns empty otherwise (feature simply off).
+/// are present. Returns empty otherwise (feature simply off). Country and page
+/// size come from `[adzuna]`; a non-empty `ADZUNA_COUNTRY` env var overrides
+/// the country.
 pub fn adzuna_sources(profile: &Profile) -> Vec<Source> {
     if !profile.adzuna.enabled {
         return Vec::new();
@@ -458,13 +460,17 @@ pub fn adzuna_sources(profile: &Profile) -> Vec<Source> {
     if !has_creds {
         return Vec::new();
     }
+    let country = std::env::var("ADZUNA_COUNTRY")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| profile.adzuna.country.clone());
     let max = profile.adzuna.max_roles.max(0) as usize;
     profile
         .target_roles
         .iter()
         .filter(|r| !r.trim().is_empty())
         .take(max)
-        .map(|r| Source::Adzuna(r.clone()))
+        .map(|r| Source::adzuna(r.clone(), &country, profile.adzuna.results_per_page))
         .collect()
 }
 

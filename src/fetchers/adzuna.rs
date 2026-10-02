@@ -2,7 +2,8 @@
 //!
 //! Endpoint: `https://api.adzuna.com/v1/api/jobs/{country}/search/1`
 //! Needs free credentials from the `ADZUNA_APP_ID` / `ADZUNA_APP_KEY`
-//! environment variables (and optional `ADZUNA_COUNTRY`, default "us").
+//! environment variables. Country and page size come from the profile's
+//! `[adzuna]` section (`ADZUNA_COUNTRY` overrides the country).
 //! Searched by one of your target roles per source, so it surfaces matching
 //! jobs at companies not on your watchlist. Lower-priority aggregator, so
 //! direct ATS links win on dedup.
@@ -17,12 +18,13 @@ use crate::text::html_to_text;
 /// Fetches Adzuna results for one search query (a target role).
 pub struct AdzunaFetcher {
     query: String,
+    country: String,
     results_per_page: i64,
 }
 
 impl AdzunaFetcher {
-    pub fn new(query: impl Into<String>) -> Self {
-        AdzunaFetcher { query: query.into(), results_per_page: 50 }
+    pub fn new(query: impl Into<String>, country: impl Into<String>, results_per_page: i64) -> Self {
+        AdzunaFetcher { query: query.into(), country: country.into(), results_per_page }
     }
 }
 
@@ -66,9 +68,7 @@ impl Fetcher for AdzunaFetcher {
             (Some(i), Some(k)) => (i, k),
             _ => return Err(anyhow!("Adzuna needs ADZUNA_APP_ID and ADZUNA_APP_KEY env vars")),
         };
-        let country = std::env::var("ADZUNA_COUNTRY").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "us".into());
-
-        let url = format!("https://api.adzuna.com/v1/api/jobs/{country}/search/1");
+        let url = format!("https://api.adzuna.com/v1/api/jobs/{}/search/1", self.country);
         let rpp = self.results_per_page.to_string();
 
         // Retry on rate-limit (429) / transient 5xx — Adzuna's free tier is

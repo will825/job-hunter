@@ -64,8 +64,8 @@ impl Default for Email {
 
 /// Adzuna aggregator config. Adzuna scans thousands of job sites, searched by
 /// your target roles — so it surfaces matching jobs at companies you never
-/// listed. Needs free credentials in `ADZUNA_APP_ID` / `ADZUNA_APP_KEY`
-/// (and optionally `ADZUNA_COUNTRY`, default "us").
+/// listed. Needs free credentials in `ADZUNA_APP_ID` / `ADZUNA_APP_KEY`.
+/// A non-empty `ADZUNA_COUNTRY` env var overrides `country`.
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct Adzuna {

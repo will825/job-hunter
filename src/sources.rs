@@ -16,9 +16,10 @@ pub enum Source {
     Remotive(String),
     /// A free aggregator; the string is a tag/search (e.g. "dev").
     RemoteOk(String),
-    /// Broad aggregator across thousands of sites (needs a free key). The string
-    /// is a search query — one of your target roles.
-    Adzuna(String),
+    /// Broad aggregator across thousands of sites (needs a free key). `query`
+    /// is one of your target roles; `country` and `results_per_page` come from
+    /// the profile's `[adzuna]` section.
+    Adzuna { query: String, country: String, results_per_page: i64 },
     /// A free aggregator; the string is an (unused) hint.
     Himalayas(String),
     /// A free aggregator; the string is a tag (e.g. "engineering").
@@ -38,7 +39,7 @@ impl Source {
             | Source::Ashby(t)
             | Source::Remotive(t)
             | Source::RemoteOk(t)
-            | Source::Adzuna(t)
+            | Source::Adzuna { query: t, .. }
             | Source::Himalayas(t)
             | Source::Jobicy(t)
             | Source::CustomPage(t) => t,
@@ -53,11 +54,24 @@ impl Source {
             Source::Ashby(_) => "ashby",
             Source::Remotive(_) => "remotive",
             Source::RemoteOk(_) => "remoteok",
-            Source::Adzuna(_) => "adzuna",
+            Source::Adzuna { .. } => "adzuna",
             Source::Himalayas(_) => "himalayas",
             Source::Jobicy(_) => "jobicy",
             Source::CustomPage(_) => "custom",
         }
+    }
+
+    /// An Adzuna search. The country must be a plain country code (it goes in
+    /// the URL path); anything else falls back to "us". Results per page are
+    /// clamped to Adzuna's 1–50.
+    pub fn adzuna(query: impl Into<String>, country: &str, results_per_page: i64) -> Source {
+        let country = country.trim().to_lowercase();
+        let country = if !country.is_empty() && country.len() <= 3 && country.bytes().all(|b| b.is_ascii_lowercase()) {
+            country
+        } else {
+            "us".to_string()
+        };
+        Source::Adzuna { query: query.into(), country, results_per_page: results_per_page.clamp(1, 50) }
     }
 
     /// Whether this source needs the optional custom-page reader.
@@ -83,7 +97,7 @@ impl Source {
             "ashby" => Some(Source::Ashby(token)),
             "remotive" => Some(Source::Remotive(token)),
             "remoteok" => Some(Source::RemoteOk(token)),
-            "adzuna" => Some(Source::Adzuna(token)),
+            "adzuna" => Some(Source::adzuna(token, "us", 50)),
             "himalayas" => Some(Source::Himalayas(token)),
             "jobicy" => Some(Source::Jobicy(token)),
             "custom" => Some(Source::CustomPage(token)),
@@ -147,4 +161,19 @@ pub fn seed() -> Vec<Source> {
         Source::Himalayas("all".to_string()),
         Source::Jobicy("engineering".to_string()),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adzuna_source_cleans_country_and_page_size() {
+        let s = Source::adzuna("Rust Engineer", " GB ", 200);
+        assert_eq!(s, Source::Adzuna { query: "Rust Engineer".into(), country: "gb".into(), results_per_page: 50 });
+        let s = Source::adzuna("x", "us/../v2", 0);
+        assert_eq!(s, Source::Adzuna { query: "x".into(), country: "us".into(), results_per_page: 1 });
+        assert_eq!(s.token(), "x");
+        assert_eq!(s.label(), "adzuna:x");
+    }
 }
