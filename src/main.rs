@@ -285,7 +285,7 @@ async fn cmd_digest(client: &reqwest::Client) -> Result<()> {
         let (subject, _html, text) = email::compose(&jobs, &notes);
         println!("\n(Email off: {} — showing the digest instead)\n", ecfg.why_not_ready());
         println!("Subject: {subject}\n{text}");
-        println!("(Set up [email] + EMAIL_APP_PASSWORD to have this emailed to you.)");
+        println!("(Turn on [email] in profile.toml and add RESEND_API_KEY to .env to have this emailed to you.)");
     }
     Ok(())
 }
