@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 use super::Fetcher;
 use crate::models::Job;
-use crate::text::html_to_text;
+use crate::text::{company_from_token, html_to_text};
 
 /// Fetches jobs from one Ashby board, identified by its token (e.g. `elevenlabs`).
 pub struct AshbyFetcher {
@@ -100,6 +100,7 @@ impl Fetcher for AshbyFetcher {
                     j.published_at,
                     raw,
                 )
+                .with_display_company(company_from_token(&self.token))
             })
             .collect();
 

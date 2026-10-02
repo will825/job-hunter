@@ -306,7 +306,7 @@ pub fn upsert_job(conn: &Connection, job: &Job) -> Result<Upsert> {
                 location = ?2, url = ?3, description = ?4,
                 posted_date = ?5, raw_json = ?6,
                 work_mode = ?7, region = ?8, seniority = ?9,
-                keyword_score = ?10, tier = ?11,
+                keyword_score = ?10, tier = ?11, company = ?12,
                 last_seen = datetime('now')
             WHERE id = ?1
             "#,
@@ -314,6 +314,7 @@ pub fn upsert_job(conn: &Connection, job: &Job) -> Result<Upsert> {
                 job.id, job.location, job.url, job.description,
                 job.posted_date, job.raw_json,
                 job.work_mode, job.region, job.seniority, job.keyword_score, job.tier,
+                job.company,
             ],
         )?;
         return Ok(Upsert::AlreadySeen);
@@ -1109,6 +1110,22 @@ mod tests {
         j.tier = "strong".into();
         upsert_job(conn, &j).unwrap();
         j
+    }
+
+    #[test]
+    fn rescanned_token_job_keeps_its_row_and_gets_the_display_name() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let old = Job::new("deepgram", "Engineer", "Remote", "u1", "ashby", "d", None, "{}");
+        upsert_job(&conn, &old).unwrap();
+        let new = old.clone().with_display_company("Deepgram");
+        assert_eq!(new.id, old.id);
+        assert_eq!(upsert_job(&conn, &new).unwrap(), Upsert::AlreadySeen);
+        let names: Vec<String> = conn
+            .prepare("SELECT company FROM jobs").unwrap()
+            .query_map([], |r| r.get(0)).unwrap()
+            .collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(names, ["Deepgram"]);
     }
 
     #[test]

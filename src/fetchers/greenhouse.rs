@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 use super::Fetcher;
 use crate::models::Job;
-use crate::text::html_to_text;
+use crate::text::{company_from_token, html_to_text};
 
 /// Fetches jobs from one Greenhouse board, identified by its token
 /// (e.g. `splice`).
@@ -51,7 +51,7 @@ struct GreenhouseJob {
     #[serde(default)]
     location: Option<GreenhouseLocation>,
     /// Some boards include the company name per job; if absent we fall back
-    /// to the board token.
+    /// to the title-cased board token.
     #[serde(default)]
     company_name: Option<String>,
 }
@@ -102,10 +102,9 @@ impl Fetcher for GreenhouseFetcher {
             .into_iter()
             .enumerate()
             .map(|(i, j)| {
-                let company = j
-                    .company_name
-                    .filter(|c| !c.trim().is_empty())
-                    .unwrap_or_else(|| company_fallback.clone());
+                // Some boards give no company name: identify the job by the
+                // token (as before, so ids stay stable) but show it title-cased.
+                let company = j.company_name.filter(|c| !c.trim().is_empty());
                 let location = j
                     .location
                     .and_then(|l| l.name)
@@ -115,8 +114,8 @@ impl Fetcher for GreenhouseFetcher {
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "{}".to_string());
 
-                Job::new(
-                    company,
+                let job = Job::new(
+                    company.as_deref().unwrap_or(company_fallback),
                     j.title,
                     location,
                     j.absolute_url,
@@ -124,7 +123,11 @@ impl Fetcher for GreenhouseFetcher {
                     html_to_text(&j.content), // Greenhouse content is HTML
                     j.updated_at,
                     raw,
-                )
+                );
+                match company {
+                    Some(_) => job,
+                    None => job.with_display_company(company_from_token(company_fallback)),
+                }
             })
             .collect();
 

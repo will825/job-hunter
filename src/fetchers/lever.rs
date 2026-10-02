@@ -9,6 +9,7 @@ use serde::Deserialize;
 
 use super::Fetcher;
 use crate::models::Job;
+use crate::text::company_from_token;
 
 /// Fetches jobs from one Lever board, identified by its token (e.g. `spotify`).
 pub struct LeverFetcher {
@@ -100,6 +101,7 @@ impl Fetcher for LeverFetcher {
                     posted,
                     raw,
                 )
+                .with_display_company(company_from_token(&self.token))
             })
             .collect();
 

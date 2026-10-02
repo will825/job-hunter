@@ -230,6 +230,23 @@ pub fn dedup_key(company: &str, title: &str, location: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// A display name for a board token: "deepgram" → "Deepgram",
+/// "hook-music" → "Hook Music". Used when a board gives no company name.
+pub fn company_from_token(token: &str) -> String {
+    token
+        .split(['-', '_', '.'])
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                Some(c) => c.to_uppercase().chain(chars).collect::<String>(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Hash of normalized company + title, *without* location: the key that
 /// groups one aggregator posting that was re-listed once per city.
 pub fn title_key(company: &str, title: &str) -> String {
@@ -243,6 +260,14 @@ pub fn title_key(company: &str, title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn company_from_token_title_cases_words() {
+        assert_eq!(company_from_token("deepgram"), "Deepgram");
+        assert_eq!(company_from_token("hook-music"), "Hook Music");
+        assert_eq!(company_from_token("some_co.io"), "Some Co Io");
+        assert_eq!(company_from_token(""), "");
+    }
 
     #[test]
     fn strips_html_and_decodes_entities() {

@@ -86,6 +86,15 @@ impl Job {
             tier: String::new(),
         }
     }
+
+    /// Show a different company name without changing the posting's identity:
+    /// `id` and `dedup_key` stay derived from the name passed to [`Job::new`].
+    /// Used by boards that only give us a token ("deepgram"), so ids from
+    /// earlier scans still match.
+    pub fn with_display_company(mut self, company: impl Into<String>) -> Self {
+        self.company = company.into();
+        self
+    }
 }
 
 /// sha256 hex of the three identifying fields, joined with a separator that
