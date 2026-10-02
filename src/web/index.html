@@ -150,6 +150,17 @@ button:disabled{opacity:.5;cursor:default;box-shadow:none}
 .navitem.active{background:linear-gradient(160deg,rgba(255,255,255,.82),rgba(255,255,255,.55));color:#0a6fd0;font-weight:600;border-color:rgba(255,255,255,.7);box-shadow:0 5px 16px rgba(40,55,90,.1),inset 0 1px 0 rgba(255,255,255,.75)}
 .spacer{flex:1}
 .sidebar .scan{width:100%;margin-top:6px;border-radius:14px}
+.scanrow{display:flex;align-items:center;gap:9px;margin-top:6px}
+.scanrow .scan{flex:1;margin-top:0 !important}
+.hdot{flex:0 0 auto;width:11px;height:11px;border-radius:50%;background:#c7ccd4;box-shadow:0 0 0 3px rgba(255,255,255,.6)}
+.hdot.ok{background:#34c759}.hdot.warn{background:#ff9f0a}.hdot.fail{background:#ff3b30}
+.hgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px 18px;margin-top:4px}
+.hgrid .k{font-size:12px;color:#6b7280}.hgrid .v{font-size:15px;font-weight:600;overflow-wrap:anywhere}
+.hkeys{display:flex;flex-wrap:wrap;gap:6px;margin-top:14px}
+.hkeys .on{background:rgba(52,199,89,.16);color:#1a8a4a;border-color:transparent}
+.hkeys .off{color:#9aa3af}
+.hfails{margin:12px 0 0;padding-left:18px;font-size:13px;color:#5b6675}
+.hfails li{overflow-wrap:anywhere}
 .scanmsg{font-size:12px;color:#5b6675;padding:8px 6px 0;text-align:center;line-height:1.35}
 .content{flex:1;min-width:0;padding:36px 52px 76px}
 .view{display:block}.view.hidden{display:none}
@@ -162,7 +173,8 @@ button:disabled{opacity:.5;cursor:default;box-shadow:none}
   .sidebar{width:auto;flex:none;height:auto;position:static;flex-direction:row;flex-wrap:wrap;align-items:center;padding:12px 14px;gap:6px}
   .brand{width:100%;padding:2px 8px 8px;font-size:19px}
   .spacer,.scanmsg{display:none}
-  .sidebar .scan{width:auto;margin:0 0 0 auto;padding:9px 16px}
+  .scanrow{margin:0 0 0 auto}
+  .sidebar .scan{width:auto;padding:9px 16px}
   .content{padding:18px 18px 50px}
 }
 /* --- Swipe view (Tinder mode) --- */
@@ -211,7 +223,10 @@ button:disabled{opacity:.5;cursor:default;box-shadow:none}
     <a class="navitem" data-view="email">Digest email</a>
     <a class="navitem" data-view="settings">Settings</a>
     <div class="spacer"></div>
-    <button id="scanBtn" class="scan" onclick="scan()">Scan now</button>
+    <div class="scanrow">
+      <span id="healthDot" class="hdot" title="Checking last run…"></span>
+      <button id="scanBtn" class="scan" onclick="scan()">Scan now</button>
+    </div>
     <div id="scanMsg" class="scanmsg"></div>
   </nav>
 
@@ -337,8 +352,13 @@ button:disabled{opacity:.5;cursor:default;box-shadow:none}
       <h1 class="viewhead">Settings</h1>
       <p class="viewsub">How Job Hunter runs.</p>
       <div class="panel">
+        <h2><span id="healthCardDot" class="hdot"></span> Health</h2>
+        <div id="health" class="muted">Loading…</div>
+      </div>
+      <div class="panel">
         <h2>Daily schedule</h2>
-        <div class="muted">A scan runs automatically every morning at 7:00 AM and emails you new matches. Your Mac just needs to be on and logged in — the screen can be off.</div>
+        <div id="schedule" class="hgrid"></div>
+        <div class="muted" style="margin-top:12px">A scan runs automatically every morning at 7:00 AM and emails you new matches.</div>
       </div>
       <div class="panel">
         <h2>Advanced tuning</h2>
@@ -448,6 +468,7 @@ async function pollScan(){
   }
   clearInterval(scanPoll); scanPoll = null;
   setScanBusy(false);
+  loadHealth();
   if(s.phase === 'failed'){ msg.textContent = (s.error && s.error.startsWith('Re-score') ? '' : 'Scan failed: ') + (s.error || 'unknown error'); return; }
   if(s.phase === 'rescored'){
     const r = s.last_rescore || {}, a = r.after || {};
@@ -463,6 +484,50 @@ async function pollScan(){
   } else msg.textContent = 'Done.';
   reloadCurrentView();
 }
+
+// Health: the sidebar dot (always) and the Settings card. Key presence comes
+// back as booleans only.
+const ago = secs => secs < 90 ? 'just now' : secs < 5400 ? `${Math.round(secs/60)} min ago`
+  : secs < 172800 ? `${Math.round(secs/3600)} h ago` : `${Math.round(secs/86400)} days ago`;
+const when = d => d.toLocaleString([], {weekday:'short', month:'short', day:'numeric', hour:'numeric', minute:'2-digit'});
+// The digest cron fires at 7:00 AM local: today if that's still ahead, else tomorrow.
+function nextRun(){
+  const d = new Date(); d.setHours(7,0,0,0);
+  if(d <= new Date()) d.setDate(d.getDate()+1);
+  return d;
+}
+const healthItem = (k, v) => `<div><div class="k">${esc(k)}</div><div class="v">${v}</div></div>`;
+async function loadHealth(){
+  let h;
+  try{ const r = await fetch('/api/health'); if(!r.ok) return; h = await r.json(); }catch(e){ return; }
+  for(const id of ['healthDot','healthCardDot']) $(id).className = 'hdot ' + (h.status || '');
+  $('healthDot').title = h.reason || '';
+  const run = h.last_run, now = h.now || Date.now()/1000;
+  const trig = {scan:'terminal scan', digest:'daily digest', web:'Scan now'};
+  const lastTxt = run ? `${esc(when(new Date(run.at*1000)))} <span class="muted">(${esc(ago(now - run.at))}, ${esc(trig[run.trigger] || run.trigger)})</span>` : 'Never';
+  const nextTxt = h.running ? 'Running now' + (h.running_phase ? ` <span class="muted">(${esc(h.running_phase)})</span>` : '') : esc(when(nextRun()));
+  $('schedule').innerHTML = healthItem('Last run', lastTxt) + healthItem('Next run', nextTxt);
+
+  const llm = h.llm ? (h.llm.enabled ? esc(h.llm.model) : 'off') : 'profile.toml didn’t load';
+  let html = `<div class="msg ${h.status==='ok' ? 'ok' : 'err'}" style="margin:0 0 14px">${esc(h.reason)}</div><div class="hgrid">`
+    + healthItem('Last run', lastTxt)
+    + healthItem('Jobs stored', esc(h.jobs_total))
+    + healthItem('AI-scored (7 days)', esc(h.ai_scored_7d))
+    + healthItem('AI model', llm);
+  if(run) html += healthItem('Boards', `${esc(run.boards_scanned)} scanned${run.boards_failed ? `, <span style="color:#c4410c">${esc(run.boards_failed)} failed</span>` : ''}`)
+    + healthItem('Last run results', `${esc(run.inserted)} new, ${esc(run.llm_scored||0)} AI-scored`);
+  html += '</div><div class="hkeys">';
+  const keys = [['groq','Groq key'],['resend','Resend key'],['adzuna','Adzuna keys'],['token','Access token']];
+  for(const [k,label] of keys) html += `<span class="pill ${h.keys && h.keys[k] ? 'on' : 'off'}">${h.keys && h.keys[k] ? '✓' : '✗'} ${esc(label)}</span>`;
+  html += '</div>';
+  if(run && run.llm_error) html += `<div class="muted" style="margin-top:12px">AI: ${esc(run.llm_error)}</div>`;
+  if(h.last_failure && h.status === 'fail') html += `<div class="muted" style="margin-top:12px">${esc(when(new Date(h.last_failure.at*1000)))}: ${esc(h.last_failure.error)}</div>`;
+  const fails = h.board_failures || [];
+  if(fails.length) html += '<ul class="hfails">' + fails.map(f => `<li><b>${esc(f.board)}</b> — ${esc(f.error)}</li>`).join('') + '</ul>';
+  $('health').innerHTML = html;
+}
+loadHealth();
+setInterval(loadHealth, 5*60*1000);
 
 // Refresh the open view's data in place (no scroll-to-top, unlike showView).
 function reloadCurrentView(){
@@ -1033,6 +1098,7 @@ function showView(v){
   if(v==='analytics') loadAnalytics();
   if(v==='profile' || v==='email') loadProfile();
   if(v==='companies') loadCompanies();
+  if(v==='settings') loadHealth();
   window.scrollTo(0,0);
 }
 document.querySelectorAll('.navitem').forEach(el=>el.addEventListener('click',()=>showView(el.dataset.view)));

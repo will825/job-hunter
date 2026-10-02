@@ -10,6 +10,7 @@
 //!   GET    /api/jobs?...          ranked jobs with filters, paged ({jobs, total})
 //!   GET    /api/jobs/:id          one job with description, AI gaps, and age
 //!   POST   /api/rescore           re-score stored jobs against the current profile
+//!   GET    /api/health            last run, key presence, model, counts (Settings + sidebar dot)
 //!
 //! If `JOBHUNTER_TOKEN` is set, every /api route requires it (header
 //! `X-Token`, or the `jh_token` cookie that `GET /?token=...` sets once).
@@ -64,6 +65,10 @@ struct ScanStatus {
     /// so the latest profile is the one applied.
     #[serde(skip)]
     rescore_again: bool,
+    /// The most recent web scan that failed outright: (unix secs, error).
+    /// Failed scans never write `last_run`, so `/api/health` reads this.
+    #[serde(skip)]
+    last_scan_failure: Option<(u64, String)>,
 }
 
 impl AppState {
@@ -103,6 +108,7 @@ pub async fn serve(
         .route("/api/scan", post(scan))
         .route("/api/scan/status", get(scan_status))
         .route("/api/rescore", post(rescore))
+        .route("/api/health", get(health))
         .route("/api/jobs", get(jobs))
         .route("/api/jobs/:id", get(job_detail))
         .route("/api/jobs/status", post(set_job_status))
@@ -298,6 +304,9 @@ async fn scan(State(st): State<AppState>) -> Response {
                 if summary.is_some() {
                     s.last_summary = summary;
                 }
+                if let Some(e) = &error {
+                    s.last_scan_failure = Some((unix_now(), e.clone()));
+                }
                 s.error = error;
                 // Release the file lock while still holding the status mutex,
                 // so a follow-up claim never sees "not running" but a held lock.
@@ -326,6 +335,7 @@ fn claim_scan(st: &AppState, phase: &'static str) -> anyhow::Result<Option<Arc<S
         phase: Some(phase),
         last_summary: status.last_summary.take(),
         last_rescore: status.last_rescore.take(),
+        last_scan_failure: status.last_scan_failure.take(),
         ..Default::default()
     };
     Ok(Some(lock))
@@ -405,6 +415,96 @@ async fn run_web_scan(st: AppState, lock: Arc<ScanLock>) -> anyhow::Result<serde
         eprintln!("couldn't record last_run: {e:#}");
     }
     Ok(pipeline::summary_json("web", &summary))
+}
+
+/// A run older than this turns the health dot red (the daily digest missed).
+const HEALTH_STALE_SECS: u64 = 36 * 3600;
+
+/// `GET /api/health`: how the last run went, which API keys are present
+/// (booleans only — values are never read out), the LLM model, and job
+/// counts. `status` is "ok" | "warn" | "fail", with `reason` for the tooltip.
+async fn health(State(st): State<AppState>) -> Response {
+    let (running, failure) = {
+        let s = st.scan.lock().unwrap_or_else(|e| e.into_inner());
+        (s.running, s.last_scan_failure.clone())
+    };
+    // A CLI scan/digest holds the lock file without touching our status.
+    let lock = crate::scan_lock::HolderInfo::read(st.lock_path.as_str());
+    let running = running || lock.is_some();
+    let llm = profile::load_or_create(&st.profile_path).map(|p| llm::LlmConfig::from_profile(&p));
+
+    let build = || -> anyhow::Result<serde_json::Value> {
+        let conn = db::connect(&st.db_path)?;
+        let last_run: Option<serde_json::Value> =
+            db::meta_get(&conn, "last_run")?.and_then(|v| serde_json::from_str(&v).ok());
+        let (status, reason) = health_status(last_run.as_ref(), failure.as_ref(), unix_now());
+        let is_set = |k: &str| std::env::var(k).is_ok_and(|v| !v.trim().is_empty());
+        Ok(json!({
+            "status": status,
+            "reason": reason,
+            "now": unix_now(),
+            "running": running,
+            "running_phase": lock.and_then(|l| l.phase),
+            "last_run": last_run,
+            "last_failure": failure.map(|(at, error)| json!({ "at": at, "error": error })),
+            "board_failures": last_run.as_ref().and_then(|r| r.get("board_errors").cloned()).unwrap_or(json!([])),
+            "keys": {
+                "groq": is_set("GROQ_API_KEY"),
+                "resend": is_set("RESEND_API_KEY"),
+                "adzuna": is_set("ADZUNA_APP_ID") && is_set("ADZUNA_APP_KEY"),
+                "token": st.token.is_some(),
+            },
+            "llm": match &llm {
+                Ok(c) => json!({ "enabled": c.enabled, "model": c.model }),
+                Err(_) => json!(null),
+            },
+            "jobs_total": db::count_jobs(&conn)?,
+            "ai_scored_7d": db::count_llm_scored_since(&conn, 7)?,
+        }))
+    };
+    match build() {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// Traffic light for the last run: "fail" if it failed outright, never ran,
+/// or is older than 36h; "warn" if some boards or the AI step failed; else "ok".
+fn health_status(
+    last_run: Option<&serde_json::Value>,
+    failure: Option<&(u64, String)>,
+    now: u64,
+) -> (&'static str, String) {
+    let at = last_run.and_then(|r| r["at"].as_u64());
+    if let Some((failed_at, e)) = failure {
+        if at.map_or(true, |at| *failed_at >= at) {
+            return ("fail", format!("Last scan failed: {e}"));
+        }
+    }
+    let (Some(run), Some(at)) = (last_run, at) else {
+        return ("fail", "No run recorded yet".into());
+    };
+    let age = now.saturating_sub(at);
+    if age > HEALTH_STALE_SECS {
+        return ("fail", format!("Last run was {} hours ago", age / 3600));
+    }
+    let n = |k: &str| run[k].as_u64().unwrap_or(0);
+    let mut problems = Vec::new();
+    if n("boards_failed") > 0 {
+        problems.push(format!("{} board(s) failed", n("boards_failed")));
+    }
+    if run["llm_enabled"].as_bool() == Some(true) {
+        if let Some(e) = run["llm_error"].as_str().filter(|e| !e.is_empty()) {
+            problems.push(format!("AI scoring: {e}"));
+        } else if n("llm_failed") > 0 {
+            problems.push(format!("AI scoring: {} call(s) failed", n("llm_failed")));
+        }
+    }
+    if problems.is_empty() {
+        ("ok", "Last run OK".into())
+    } else {
+        ("warn", problems.join("; "))
+    }
 }
 
 fn unix_now() -> u64 {
@@ -822,5 +922,27 @@ mod tests {
         assert!(ct_eq(b"abc", b"abc"));
         assert!(!ct_eq(b"abc", b"abd"));
         assert!(!ct_eq(b"abc", b"ab"));
+    }
+
+    #[test]
+    fn health_status_traffic_light() {
+        let now = 1_000_000;
+        let run = |extra: serde_json::Value| {
+            let mut v = json!({ "at": now - 3600, "boards_failed": 0, "llm_enabled": true, "llm_failed": 0, "llm_error": null });
+            v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            v
+        };
+        assert_eq!(health_status(Some(&run(json!({}))), None, now).0, "ok");
+        assert_eq!(health_status(Some(&run(json!({ "boards_failed": 2 }))), None, now).0, "warn");
+        assert_eq!(health_status(Some(&run(json!({ "llm_error": "Groq daily quota used up" }))), None, now).0, "warn");
+        // AI off: its error is irrelevant.
+        assert_eq!(health_status(Some(&run(json!({ "llm_enabled": false, "llm_error": "x" }))), None, now).0, "ok");
+        assert_eq!(health_status(Some(&run(json!({ "at": now - 37 * 3600 }))), None, now).0, "fail");
+        assert_eq!(health_status(None, None, now).0, "fail");
+        // A failed scan after the last good run is red; an older one doesn't matter.
+        let failed = (now - 60, "boom".to_string());
+        assert_eq!(health_status(Some(&run(json!({}))), Some(&failed), now).0, "fail");
+        let old_failure = (now - 7200, "boom".to_string());
+        assert_eq!(health_status(Some(&run(json!({}))), Some(&old_failure), now).0, "ok");
     }
 }

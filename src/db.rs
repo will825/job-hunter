@@ -92,6 +92,7 @@ fn migrate(conn: &Connection) -> Result<()> {
         ("status_at", "TEXT"),
         ("locations", "TEXT"),
         ("title_key", "TEXT"),
+        ("llm_scored_at", "TEXT"),
     ];
     for (col, decl) in wanted {
         if !existing.contains(*col) {
@@ -176,7 +177,8 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
             note         TEXT,
             status_at    TEXT,
             locations    TEXT,             -- JSON array; >1 entry when merged across cities
-            title_key    TEXT              -- hash of normalized company + title (no location)
+            title_key    TEXT,             -- hash of normalized company + title (no location)
+            llm_scored_at TEXT             -- when the LLM last scored it (NULL = never/unknown)
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedup_key ON jobs(dedup_key);
 
@@ -522,6 +524,18 @@ pub fn prune_stale(conn: &Connection, max_age_days: i64) -> Result<usize> {
     Ok(n)
 }
 
+/// Jobs the LLM scored in the last `days` days (twins that inherited a
+/// verdict count too). Rows scored before `llm_scored_at` existed don't count.
+pub fn count_llm_scored_since(conn: &Connection, days: i64) -> Result<i64> {
+    let cutoff = format!("-{} days", days.max(1));
+    let n = conn.query_row(
+        "SELECT COUNT(*) FROM jobs WHERE llm_scored_at >= datetime('now', ?1)",
+        [cutoff],
+        |r| r.get(0),
+    )?;
+    Ok(n)
+}
+
 // --- Meta key/value (app state) ---
 
 pub fn meta_get(conn: &Connection, key: &str) -> Result<Option<String>> {
@@ -680,7 +694,9 @@ pub fn top_for_rescore(conn: &Connection, limit: i64, hide_onsite: bool) -> Resu
 /// truth, so a job's tier always matches its numeric fit.
 pub fn set_llm_verdict(conn: &Connection, id: &str, fit_score: i64, reasoning: &str, gaps: &str) -> Result<()> {
     conn.execute(
-        "UPDATE jobs SET llm_score = ?2, llm_reasoning = ?3, llm_gaps = ?4 WHERE id = ?1",
+        "UPDATE jobs SET llm_score = ?2, llm_reasoning = ?3, llm_gaps = ?4,
+                         llm_scored_at = datetime('now')
+         WHERE id = ?1",
         rusqlite::params![id, fit_score, reasoning, gaps],
     )?;
     Ok(())
@@ -692,8 +708,8 @@ pub fn set_llm_verdict(conn: &Connection, id: &str, fit_score: i64, reasoning: &
 /// deserve different scores. Returns how many rows were updated.
 pub fn copy_llm_verdict_to_twins(conn: &Connection, id: &str) -> Result<usize> {
     let n = conn.execute(
-        "UPDATE jobs SET (llm_score, llm_reasoning, llm_gaps) =
-             (SELECT llm_score, llm_reasoning, llm_gaps FROM jobs WHERE id = ?1)
+        "UPDATE jobs SET (llm_score, llm_reasoning, llm_gaps, llm_scored_at) =
+             (SELECT llm_score, llm_reasoning, llm_gaps, llm_scored_at FROM jobs WHERE id = ?1)
          WHERE llm_score IS NULL AND id != ?1
            AND (title_key, work_mode) =
                (SELECT title_key, work_mode FROM jobs
@@ -1491,5 +1507,22 @@ mod tests {
         assert_eq!(d.row.title, "Secs");
 
         assert!(job_detail(&conn, "nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn counts_recent_llm_scores_including_twins() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let a = job("greenhouse", "Rust Engineer", "u1");
+        let old = job("greenhouse", "Go Engineer", "u2");
+        upsert_job(&conn, &a).unwrap();
+        upsert_job(&conn, &old).unwrap();
+        assert_eq!(count_llm_scored_since(&conn, 7).unwrap(), 0);
+
+        set_llm_verdict(&conn, &a.id, 70, "ok", "").unwrap();
+        set_llm_verdict(&conn, &old.id, 70, "ok", "").unwrap();
+        conn.execute("UPDATE jobs SET llm_scored_at = datetime('now', '-8 days') WHERE id = ?1", [&old.id])
+            .unwrap();
+        assert_eq!(count_llm_scored_since(&conn, 7).unwrap(), 1);
     }
 }
