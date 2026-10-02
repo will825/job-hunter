@@ -437,8 +437,9 @@ async fn health(State(st): State<AppState>) -> Response {
         let conn = db::connect(&st.db_path)?;
         let last_run: Option<serde_json::Value> =
             db::meta_get(&conn, "last_run")?.and_then(|v| serde_json::from_str(&v).ok());
-        let (status, reason) = health_status(last_run.as_ref(), failure.as_ref(), unix_now());
         let is_set = |k: &str| std::env::var(k).is_ok_and(|v| !v.trim().is_empty());
+        let key_missing = llm.as_ref().is_ok_and(|c| c.enabled) && !is_set("GROQ_API_KEY");
+        let (status, reason) = health_status(last_run.as_ref(), failure.as_ref(), key_missing, unix_now());
         Ok(json!({
             "status": status,
             "reason": reason,
@@ -474,10 +475,12 @@ const HEALTH_AI_FAIL_RATIO: f64 = 0.2;
 
 /// Traffic light for the last run: "fail" if it failed outright, never ran,
 /// or is older than 36h; "warn" if any board failed, or the AI step tripped
-/// its breaker, ran out of quota, or lost more than 20% of its calls; else "ok".
+/// its breaker, ran out of quota, or lost more than 20% of its calls, or if
+/// `[llm]` is on but GROQ_API_KEY is missing (`llm_key_missing`); else "ok".
 fn health_status(
     last_run: Option<&serde_json::Value>,
     failure: Option<&(u64, String)>,
+    llm_key_missing: bool,
     now: u64,
 ) -> (&'static str, String) {
     let at = last_run.and_then(|r| r["at"].as_u64());
@@ -498,7 +501,9 @@ fn health_status(
     if n("boards_failed") > 0 {
         problems.push(format!("{} board(s) failed", n("boards_failed")));
     }
-    if run["llm_enabled"].as_bool() == Some(true) {
+    if llm_key_missing {
+        problems.push("AI scoring is on but GROQ_API_KEY is missing".into());
+    } else if run["llm_enabled"].as_bool() == Some(true) {
         let flag = |k: &str| run[k].as_bool() == Some(true);
         let (scored, failed) = (n("llm_scored"), n("llm_failed"));
         let calls = scored + failed;
@@ -946,23 +951,28 @@ mod tests {
             v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
             v
         };
-        assert_eq!(health_status(Some(&run(json!({}))), None, now).0, "ok");
-        assert_eq!(health_status(Some(&run(json!({ "boards_failed": 2 }))), None, now).0, "warn");
+        assert_eq!(health_status(Some(&run(json!({}))), None, false, now).0, "ok");
+        assert_eq!(health_status(Some(&run(json!({ "boards_failed": 2 }))), None, false, now).0, "warn");
         // A stray 429 among many good calls (≤20% failed) is fine…
         let stray = json!({ "llm_failed": 2, "llm_scored": 18, "llm_error": "429 Too Many Requests" });
-        assert_eq!(health_status(Some(&run(stray)), None, now).0, "ok");
+        assert_eq!(health_status(Some(&run(stray)), None, false, now).0, "ok");
         // …but more than 20%, a tripped breaker, or a spent quota is amber.
-        assert_eq!(health_status(Some(&run(json!({ "llm_failed": 6, "llm_scored": 14 }))), None, now).0, "warn");
-        assert_eq!(health_status(Some(&run(json!({ "llm_failed": 3, "llm_scored": 0, "llm_tripped": true }))), None, now).0, "warn");
-        assert_eq!(health_status(Some(&run(json!({ "llm_failed": 1, "llm_quota_exhausted": true }))), None, now).0, "warn");
+        assert_eq!(health_status(Some(&run(json!({ "llm_failed": 6, "llm_scored": 14 }))), None, false, now).0, "warn");
+        assert_eq!(health_status(Some(&run(json!({ "llm_failed": 3, "llm_scored": 0, "llm_tripped": true }))), None, false, now).0, "warn");
+        assert_eq!(health_status(Some(&run(json!({ "llm_failed": 1, "llm_quota_exhausted": true }))), None, false, now).0, "warn");
+        // [llm] on with no key: amber with that reason (even if the last run is clean).
+        let (status, reason) = health_status(Some(&run(json!({}))), None, true, now);
+        assert_eq!((status, reason.as_str()), ("warn", "AI scoring is on but GROQ_API_KEY is missing"));
+        // A stale run still wins: red.
+        assert_eq!(health_status(Some(&run(json!({ "at": now - 37 * 3600 }))), None, true, now).0, "fail");
         // AI off: its failures are irrelevant.
-        assert_eq!(health_status(Some(&run(json!({ "llm_enabled": false, "llm_failed": 9, "llm_scored": 0 }))), None, now).0, "ok");
-        assert_eq!(health_status(Some(&run(json!({ "at": now - 37 * 3600 }))), None, now).0, "fail");
-        assert_eq!(health_status(None, None, now).0, "fail");
+        assert_eq!(health_status(Some(&run(json!({ "llm_enabled": false, "llm_failed": 9, "llm_scored": 0 }))), None, false, now).0, "ok");
+        assert_eq!(health_status(Some(&run(json!({ "at": now - 37 * 3600 }))), None, false, now).0, "fail");
+        assert_eq!(health_status(None, None, false, now).0, "fail");
         // A failed scan after the last good run is red; an older one doesn't matter.
         let failed = (now - 60, "boom".to_string());
-        assert_eq!(health_status(Some(&run(json!({}))), Some(&failed), now).0, "fail");
+        assert_eq!(health_status(Some(&run(json!({}))), Some(&failed), false, now).0, "fail");
         let old_failure = (now - 7200, "boom".to_string());
-        assert_eq!(health_status(Some(&run(json!({}))), Some(&old_failure), now).0, "ok");
+        assert_eq!(health_status(Some(&run(json!({}))), Some(&old_failure), false, now).0, "ok");
     }
 }

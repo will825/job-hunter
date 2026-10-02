@@ -93,9 +93,12 @@ impl Fetcher for AdzunaFetcher {
                 tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
                 continue;
             }
-            break sent
-                .error_for_status()
-                .with_context(|| format!("Adzuna returned an error status for '{}'", self.query))?;
+            // Name the status ourselves: reqwest's own error includes the URL,
+            // which carries the API keys.
+            if !status.is_success() {
+                return Err(anyhow!("Adzuna returned HTTP {status} for '{}'", self.query));
+            }
+            break sent;
         };
 
         let body = resp.text().await.context("reading Adzuna response")?;
