@@ -474,7 +474,8 @@ async fn health(State(st): State<AppState>) -> Response {
 const HEALTH_AI_FAIL_RATIO: f64 = 0.2;
 
 /// Traffic light for the last run: "fail" if it failed outright, never ran,
-/// or is older than 36h; "warn" if any board failed, or the AI step tripped
+/// or is older than 36h; "warn" if a board failed in both this run and the
+/// one before (`prev_failed_boards`; a one-off failure is ignored), or the AI step tripped
 /// its breaker, ran out of quota, or lost more than 20% of its calls, or if
 /// `[llm]` is on but GROQ_API_KEY is missing (`llm_key_missing`); else "ok".
 fn health_status(
@@ -498,8 +499,11 @@ fn health_status(
     }
     let n = |k: &str| run[k].as_u64().unwrap_or(0);
     let mut problems = Vec::new();
-    if n("boards_failed") > 0 {
-        problems.push(format!("{} board(s) failed", n("boards_failed")));
+    let prev: std::collections::HashSet<String> =
+        serde_json::from_value(run["prev_failed_boards"].clone()).unwrap_or_default();
+    let repeated = pipeline::failed_boards(run).into_iter().filter(|b| prev.contains(b)).count();
+    if repeated > 0 {
+        problems.push(format!("{repeated} board(s) failed two runs in a row"));
     }
     if llm_key_missing {
         problems.push("AI scoring is on but GROQ_API_KEY is missing".into());
@@ -952,7 +956,14 @@ mod tests {
             v
         };
         assert_eq!(health_status(Some(&run(json!({}))), None, false, now).0, "ok");
-        assert_eq!(health_status(Some(&run(json!({ "boards_failed": 2 }))), None, false, now).0, "warn");
+        // A board failing once is a blip; failing two runs in a row is amber.
+        let errs = json!([{ "board": "lever:spotify", "error": "500" }, { "board": "ashby:suno", "error": "500" }]);
+        let once = json!({ "boards_failed": 2, "board_errors": errs, "prev_failed_boards": ["greenhouse:x"] });
+        assert_eq!(health_status(Some(&run(once)), None, false, now).0, "ok");
+        assert_eq!(health_status(Some(&run(json!({ "boards_failed": 2, "board_errors": errs }))), None, false, now).0, "ok");
+        let twice = json!({ "boards_failed": 2, "board_errors": errs, "prev_failed_boards": ["ashby:suno"] });
+        let (status, reason) = health_status(Some(&run(twice)), None, false, now);
+        assert_eq!((status, reason.as_str()), ("warn", "1 board(s) failed two runs in a row"));
         // A stray 429 among many good calls (≤20% failed) is fine…
         let stray = json!({ "llm_failed": 2, "llm_scored": 18, "llm_error": "429 Too Many Requests" });
         assert_eq!(health_status(Some(&run(stray)), None, false, now).0, "ok");

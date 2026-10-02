@@ -161,9 +161,25 @@ impl LlmTally {
 }
 
 /// Save a run's summary as JSON in `meta` under `last_run`, for the web UI.
-/// `trigger` is what started the run: "scan", "digest", or "web".
+/// `trigger` is what started the run: "scan", "digest", or "web". The previous
+/// run's failed board labels are kept as `prev_failed_boards`, so health can
+/// tell a board that keeps failing from a one-off blip.
 pub fn record_last_run(conn: &Connection, trigger: &str, s: &ScanSummary) -> Result<()> {
-    db::meta_set(conn, "last_run", &summary_json(trigger, s).to_string())
+    let prev = db::meta_get(conn, "last_run")?
+        .and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
+        .map(|r| failed_boards(&r))
+        .unwrap_or_default();
+    let mut run = summary_json(trigger, s);
+    run["prev_failed_boards"] = serde_json::json!(prev);
+    db::meta_set(conn, "last_run", &run.to_string())
+}
+
+/// The labels of the boards that failed in a stored run (its `board_errors`).
+pub fn failed_boards(run: &serde_json::Value) -> Vec<String> {
+    run["board_errors"]
+        .as_array()
+        .map(|errs| errs.iter().filter_map(|e| e["board"].as_str().map(String::from)).collect())
+        .unwrap_or_default()
 }
 
 /// Add one field to the stored `last_run` (e.g. the digest's first-run
@@ -525,6 +541,24 @@ mod tests {
         note_last_run(&conn, "digest", "digest_baselined", 7.into()).unwrap();
         let run: serde_json::Value = serde_json::from_str(&db::meta_get(&conn, "last_run").unwrap().unwrap()).unwrap();
         assert_eq!((run["inserted"].as_u64(), run["digest_baselined"].as_u64()), (Some(5), Some(7)));
+    }
+
+    #[test]
+    fn last_run_keeps_the_previous_runs_failed_boards() {
+        let conn = Connection::open_in_memory().unwrap();
+        db::init_schema(&conn).unwrap();
+        let failing = |boards: &[&str]| ScanSummary {
+            failures: boards.iter().map(|b| (b.to_string(), "HTTP 500".to_string())).collect(),
+            ..Default::default()
+        };
+        let stored = || -> serde_json::Value {
+            serde_json::from_str(&db::meta_get(&conn, "last_run").unwrap().unwrap()).unwrap()
+        };
+        record_last_run(&conn, "scan", &failing(&["lever:spotify", "ashby:suno"])).unwrap();
+        assert_eq!(stored()["prev_failed_boards"], serde_json::json!([]));
+        record_last_run(&conn, "web", &failing(&["ashby:suno"])).unwrap();
+        assert_eq!(stored()["prev_failed_boards"], serde_json::json!(["lever:spotify", "ashby:suno"]));
+        assert_eq!(failed_boards(&stored()), ["ashby:suno"]);
     }
 
     #[test]
