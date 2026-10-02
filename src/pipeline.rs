@@ -474,19 +474,16 @@ pub fn adzuna_sources(profile: &Profile) -> Vec<Source> {
         .collect()
 }
 
-/// Load the watchlist from the DB (seeding defaults on first run).
+/// Load the watchlist from the DB. Defaults are seeded once, on a brand-new
+/// DB (`db::init`); an emptied watchlist stays empty.
 pub fn load_sources(conn: &Connection) -> Result<Vec<Source>> {
     let companies = db::list_companies(conn)?;
     // Preserve a stable scan order (oldest first) for readable output.
-    let mut sources: Vec<Source> = companies
+    Ok(companies
         .iter()
         .rev()
         .filter_map(|c| Source::from_ats(&c.ats, &c.token))
-        .collect();
-    if sources.is_empty() {
-        sources = crate::sources::seed();
-    }
-    Ok(sources)
+        .collect())
 }
 
 #[cfg(test)]
@@ -495,6 +492,15 @@ mod tests {
 
     fn cfg(enabled: bool, key: Option<&str>) -> LlmConfig {
         LlmConfig::for_test(enabled, key)
+    }
+
+    #[test]
+    fn emptied_watchlist_stays_empty() {
+        let conn = Connection::open_in_memory().unwrap();
+        db::init_schema(&conn).unwrap();
+        assert!(load_sources(&conn).unwrap().is_empty());
+        db::add_company(&conn, "lever", "spotify", "lever:spotify").unwrap();
+        assert_eq!(load_sources(&conn).unwrap(), [Source::Lever("spotify".into())]);
     }
 
     #[test]
