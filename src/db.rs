@@ -44,6 +44,7 @@ const SEED_VERSION: i64 = 2;
 /// - Brand-new DB (v0): add the whole seed list.
 /// - Upgrade (v < current): add only the defaults introduced since, so a user's
 ///   deletions of older defaults are preserved.
+///
 /// Uses INSERT OR IGNORE, so nothing is ever duplicated.
 fn seed_defaults(conn: &Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -1416,7 +1417,7 @@ mod tests {
         init_schema(&conn).unwrap();
         migrate(&conn).unwrap();
         for i in 0..5 {
-            let mut j = Job::new("Co", &format!("Engineer {i}"), "Remote", &format!("u{i}"), "greenhouse", "d", None, "{}");
+            let mut j = Job::new("Co", format!("Engineer {i}"), "Remote", format!("u{i}"), "greenhouse", "d", None, "{}");
             j.work_mode = if i == 0 { "onsite".into() } else { "remote".into() };
             j.keyword_score = i;
             upsert_job(&conn, &j).unwrap();

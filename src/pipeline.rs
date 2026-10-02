@@ -437,7 +437,7 @@ pub async fn full_scan(
         .filter(|s| !s.is_custom() || custom_enabled)
         .collect();
     sources.extend(adzuna_sources(profile));
-    let ctx = custom_enabled.then(|| CustomCtx { cfg: &cfg, profile });
+    let ctx = custom_enabled.then_some(CustomCtx { cfg: &cfg, profile });
 
     let fetched = fetch_all(client, &sources, ctx.as_ref(), &mut progress).await;
     let mut summary = store_all(conn, &model, fetched)?;
@@ -618,8 +618,10 @@ mod tests {
         db::set_llm_verdict(&conn, &judged.id, 50, "ok", "").unwrap();
         db::rederive_llm_tiers(&conn, false, old.llm_tiers).unwrap();
 
-        let mut profile = Profile::default();
-        profile.target_roles = vec!["Rust Engineer".into(), "Rust Developer".into()];
+        let profile = Profile {
+            target_roles: vec!["Rust Engineer".into(), "Rust Developer".into()],
+            ..Default::default()
+        };
         let s = rescore_all(&conn, &profile.compile()).unwrap();
 
         let tier = |id: &str| -> String {

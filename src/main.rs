@@ -314,7 +314,7 @@ async fn cmd_doctor(client: &reqwest::Client) -> Result<()> {
         Err(format!("{PROFILE_PATH} not found — copy profile.example.toml to {PROFILE_PATH}"))
     };
     let profile = parsed.as_ref().ok();
-    let enabled = |f: fn(&profile::Profile) -> bool| profile.map_or(true, f);
+    let enabled = |f: fn(&profile::Profile) -> bool| profile.is_none_or(f);
 
     // Keys: only presence is checked. Each is needed only when its feature is on.
     report(Some(std::path::Path::new(ENV_FILE).exists()), &format!("{ENV_FILE} file present"));

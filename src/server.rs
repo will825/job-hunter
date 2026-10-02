@@ -485,7 +485,7 @@ fn health_status(
 ) -> (&'static str, String) {
     let at = last_run.and_then(|r| r["at"].as_u64());
     if let Some((failed_at, e)) = failure {
-        if at.map_or(true, |at| *failed_at >= at) {
+        if at.is_none_or(|at| *failed_at >= at) {
             return ("fail", format!("Last scan failed: {e}"));
         }
     }

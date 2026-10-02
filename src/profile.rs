@@ -116,16 +116,10 @@ impl Default for Llm {
 /// The optional "watch any careers page" feature (headless + LLM reader).
 /// Off by default — flip to `true` once you want it, delete the section or set
 /// `false` to disable it entirely.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct CustomPages {
     pub enabled: bool,
-}
-
-impl Default for CustomPages {
-    fn default() -> Self {
-        CustomPages { enabled: false }
-    }
 }
 
 /// Skills in three tiers by how much they set you apart.

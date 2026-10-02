@@ -160,7 +160,7 @@ fn host_of(url: &str) -> Option<String> {
 
 fn path_segments(url: &str) -> Vec<String> {
     let no_scheme = url.splitn(2, "://").last().unwrap_or(url);
-    let after_host = no_scheme.splitn(2, '/').nth(1).unwrap_or("");
+    let after_host = no_scheme.split_once('/').map_or("", |(_, rest)| rest);
     let path = after_host.split(['?', '#']).next().unwrap_or("");
     path.split('/')
         .filter(|s| !s.is_empty())
