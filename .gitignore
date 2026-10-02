@@ -34,3 +34,6 @@ node_modules/
 /backups/
 profile.toml.bak*
 jobs.db.bak*
+
+# Local Claude Code tool files (e.g. launch.json)
+.claude/

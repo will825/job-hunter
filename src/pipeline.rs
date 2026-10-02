@@ -66,6 +66,8 @@ pub struct ScanSummary {
     pub llm_error: Option<String>,
     /// Groq's daily quota ran out this run (the LLM step stopped early).
     pub llm_quota_exhausted: bool,
+    /// The LLM circuit breaker opened (remaining candidates were skipped).
+    pub llm_tripped: bool,
     /// Estimated prompt tokens the LLM calls used (chars / 4), to watch the
     /// daily cap.
     pub llm_tokens_est: u64,
@@ -78,6 +80,7 @@ impl ScanSummary {
         self.llm_scored = tally.scored;
         self.llm_failed = tally.failed;
         self.llm_quota_exhausted = tally.quota_exhausted;
+        self.llm_tripped = tally.tripped;
         self.llm_tokens_est = tally.tokens_est;
         self.llm_error = if cfg.enabled && !cfg.is_ready() {
             Some(cfg.why_not_ready().to_string())
@@ -192,6 +195,7 @@ pub fn summary_json(trigger: &str, s: &ScanSummary) -> serde_json::Value {
         "llm_failed": s.llm_failed,
         "llm_error": s.llm_error,
         "llm_quota_exhausted": s.llm_quota_exhausted,
+        "llm_tripped": s.llm_tripped,
         "llm_tokens_est": s.llm_tokens_est,
         "board_errors": board_errors,
     })

@@ -468,8 +468,13 @@ async fn health(State(st): State<AppState>) -> Response {
     }
 }
 
+/// Share of AI calls that may fail (e.g. a 429 that ran out of retries)
+/// before the health dot turns amber.
+const HEALTH_AI_FAIL_RATIO: f64 = 0.2;
+
 /// Traffic light for the last run: "fail" if it failed outright, never ran,
-/// or is older than 36h; "warn" if some boards or the AI step failed; else "ok".
+/// or is older than 36h; "warn" if any board failed, or the AI step tripped
+/// its breaker, ran out of quota, or lost more than 20% of its calls; else "ok".
 fn health_status(
     last_run: Option<&serde_json::Value>,
     failure: Option<&(u64, String)>,
@@ -494,10 +499,15 @@ fn health_status(
         problems.push(format!("{} board(s) failed", n("boards_failed")));
     }
     if run["llm_enabled"].as_bool() == Some(true) {
-        if let Some(e) = run["llm_error"].as_str().filter(|e| !e.is_empty()) {
-            problems.push(format!("AI scoring: {e}"));
-        } else if n("llm_failed") > 0 {
-            problems.push(format!("AI scoring: {} call(s) failed", n("llm_failed")));
+        let flag = |k: &str| run[k].as_bool() == Some(true);
+        let (scored, failed) = (n("llm_scored"), n("llm_failed"));
+        let calls = scored + failed;
+        if flag("llm_quota_exhausted") {
+            problems.push(format!("AI scoring: {}", pipeline::LlmTally::QUOTA_MSG));
+        } else if flag("llm_tripped") {
+            problems.push(format!("AI scoring stopped after {failed} failed call(s)"));
+        } else if calls > 0 && failed as f64 > calls as f64 * HEALTH_AI_FAIL_RATIO {
+            problems.push(format!("AI scoring: {failed} of {calls} calls failed"));
         }
     }
     if problems.is_empty() {
@@ -928,15 +938,25 @@ mod tests {
     fn health_status_traffic_light() {
         let now = 1_000_000;
         let run = |extra: serde_json::Value| {
-            let mut v = json!({ "at": now - 3600, "boards_failed": 0, "llm_enabled": true, "llm_failed": 0, "llm_error": null });
+            let mut v = json!({
+                "at": now - 3600, "boards_failed": 0, "llm_enabled": true,
+                "llm_scored": 20, "llm_failed": 0, "llm_error": null,
+                "llm_quota_exhausted": false, "llm_tripped": false,
+            });
             v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
             v
         };
         assert_eq!(health_status(Some(&run(json!({}))), None, now).0, "ok");
         assert_eq!(health_status(Some(&run(json!({ "boards_failed": 2 }))), None, now).0, "warn");
-        assert_eq!(health_status(Some(&run(json!({ "llm_error": "Groq daily quota used up" }))), None, now).0, "warn");
-        // AI off: its error is irrelevant.
-        assert_eq!(health_status(Some(&run(json!({ "llm_enabled": false, "llm_error": "x" }))), None, now).0, "ok");
+        // A stray 429 among many good calls (≤20% failed) is fine…
+        let stray = json!({ "llm_failed": 2, "llm_scored": 18, "llm_error": "429 Too Many Requests" });
+        assert_eq!(health_status(Some(&run(stray)), None, now).0, "ok");
+        // …but more than 20%, a tripped breaker, or a spent quota is amber.
+        assert_eq!(health_status(Some(&run(json!({ "llm_failed": 6, "llm_scored": 14 }))), None, now).0, "warn");
+        assert_eq!(health_status(Some(&run(json!({ "llm_failed": 3, "llm_scored": 0, "llm_tripped": true }))), None, now).0, "warn");
+        assert_eq!(health_status(Some(&run(json!({ "llm_failed": 1, "llm_quota_exhausted": true }))), None, now).0, "warn");
+        // AI off: its failures are irrelevant.
+        assert_eq!(health_status(Some(&run(json!({ "llm_enabled": false, "llm_failed": 9, "llm_scored": 0 }))), None, now).0, "ok");
         assert_eq!(health_status(Some(&run(json!({ "at": now - 37 * 3600 }))), None, now).0, "fail");
         assert_eq!(health_status(None, None, now).0, "fail");
         // A failed scan after the last good run is red; an older one doesn't matter.
