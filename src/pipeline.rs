@@ -166,6 +166,23 @@ pub fn record_last_run(conn: &Connection, trigger: &str, s: &ScanSummary) -> Res
     db::meta_set(conn, "last_run", &summary_json(trigger, s).to_string())
 }
 
+/// Add one field to the stored `last_run` (e.g. the digest's first-run
+/// baseline count). With no readable `last_run`, starts one for `trigger`.
+pub fn note_last_run(conn: &Connection, trigger: &str, key: &str, value: serde_json::Value) -> Result<()> {
+    let mut run = db::meta_get(conn, "last_run")?
+        .and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| {
+            let at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            serde_json::json!({ "at": at, "trigger": trigger })
+        });
+    run[key] = value;
+    db::meta_set(conn, "last_run", &run.to_string())
+}
+
 /// A run's summary as JSON — the shape stored in `last_run` and returned by
 /// the web scan status.
 pub fn summary_json(trigger: &str, s: &ScanSummary) -> serde_json::Value {
@@ -494,6 +511,20 @@ mod tests {
 
     fn cfg(enabled: bool, key: Option<&str>) -> LlmConfig {
         LlmConfig::for_test(enabled, key)
+    }
+
+    #[test]
+    fn note_last_run_adds_a_field() {
+        let conn = Connection::open_in_memory().unwrap();
+        db::init_schema(&conn).unwrap();
+        note_last_run(&conn, "digest", "digest_baselined", 3.into()).unwrap();
+        let run: serde_json::Value = serde_json::from_str(&db::meta_get(&conn, "last_run").unwrap().unwrap()).unwrap();
+        assert_eq!((run["trigger"].as_str(), run["digest_baselined"].as_u64()), (Some("digest"), Some(3)));
+
+        record_last_run(&conn, "scan", &ScanSummary { inserted: 5, ..Default::default() }).unwrap();
+        note_last_run(&conn, "digest", "digest_baselined", 7.into()).unwrap();
+        let run: serde_json::Value = serde_json::from_str(&db::meta_get(&conn, "last_run").unwrap().unwrap()).unwrap();
+        assert_eq!((run["inserted"].as_u64(), run["digest_baselined"].as_u64()), (Some(5), Some(7)));
     }
 
     #[test]

@@ -240,6 +240,9 @@ async fn cmd_digest(client: &reqwest::Client) -> Result<()> {
     if db::meta_get(&conn, "digest_baselined")?.as_deref() != Some("1") {
         let n = db::baseline_notified(&conn)?;
         db::meta_set(&conn, "digest_baselined", "1")?;
+        if let Err(e) = pipeline::note_last_run(&conn, "digest", "digest_baselined", n.into()) {
+            eprintln!("warning: couldn't record the baseline in last_run: {e:#}");
+        }
         println!("\nFirst digest run — baselined {n} existing match(es).");
         println!("From now on, digests email only jobs that appear after this point.");
         return Ok(());
