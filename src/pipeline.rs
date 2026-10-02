@@ -652,6 +652,26 @@ mod tests {
     }
 
     #[test]
+    fn board_closing_never_touches_other_sources_with_the_same_company() {
+        let conn = Connection::open_in_memory().unwrap();
+        db::init_schema(&conn).unwrap();
+        let model = Profile::default().compile();
+        let gh = |title: &str, url: &str| Job::new("Anthropic", title, "Remote", url, "greenhouse", "d", None, "{}");
+        let agg = Job::new("Anthropic", "Research Engineer", "Remote", "adz-1", "adzuna", "d", None, "{}");
+        let anthropic = || Source::Greenhouse("anthropic".into());
+        store_all(&conn, &model, vec![
+            board(anthropic(), Ok(vec![gh("Policy Lead", "gh-1")])),
+            board(Source::Adzuna { query: "x".into(), country: "us".into(), results_per_page: 50 }, Ok(vec![agg])),
+        ]).unwrap();
+        conn.execute("UPDATE jobs SET board = NULL", []).unwrap(); // old rows: matched by company
+        age_last_seen(&conn);
+
+        let s = store_all(&conn, &model, vec![board(anthropic(), Ok(vec![]))]).unwrap();
+        assert_eq!(s.closed, 1, "only the greenhouse row");
+        assert_eq!(open_titles(&conn), ["Research Engineer"]);
+    }
+
+    #[test]
     fn liveness_closures_survive_a_board_still_listing_the_job() {
         let conn = Connection::open_in_memory().unwrap();
         db::init_schema(&conn).unwrap();
