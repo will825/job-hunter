@@ -28,13 +28,15 @@ So I built it. It now runs 24/7 on a Raspberry Pi and emails me a ranked shortli
 - 5 aggregators (**Adzuna, Remotive, RemoteOK, Himalayas, Jobicy**)
 - Paste-a-careers-page detection: sniffs a custom page's HTML for an embedded ATS board
 - Optional LLM reader that turns an arbitrary careers page into structured jobs
-- Stable content-hash **deduplication** across all sources
+- Stable content-hash **deduplication** across all sources; aggregator postings re-listed once per city fold into one job with all its locations
+- Postings a board stops listing are pruned after 14 days (anything you've triaged is kept)
 
 **Scoring**
 - **Stage 1 — keyword model:** a transparent weighted score over title + description (fast, runs on every job)
 - **Stage 2 — LLM re-rank:** Groq reads the shortlist against your bio and returns a genuine fit score, tier, and a one-line reason
 - Structured classification at ingest: **work mode** (remote/hybrid/onsite), **region**, **seniority** — so filters work on clean columns, not messy location strings
 - Tiering: `Apply now` / `Strong` / `Maybe`, with thresholds you can tune
+- Editing your profile (or uploading a resume) re-scores every stored job in the background — no re-fetch needed
 
 **Using it**
 - Glassmorphism web dashboard (single embedded HTML file)
@@ -42,7 +44,8 @@ So I built it. It now runs 24/7 on a Raspberry Pi and emails me a ranked shortli
 - **Swipe** — one job at a time, drag right to save / left to pass (works great on a phone)
 - **Tracker** — a saved → applied → interviewing → offer pipeline board
 - **Analytics** — funnel, matches by tier, and which sources actually produce good matches
-- **Daily digest email** via Resend — only new matches since last run
+- **Profile**, **Watched companies**, **Digest email** preview, and **Settings** with a Health card (last run, board failures, AI status, which keys are set) and a status dot next to Scan now
+- **Daily digest email** via Resend — only new matches since last run; if AI scoring fails it falls back to keyword matches and says why
 
 ---
 
@@ -129,12 +132,20 @@ in `profile.toml`.
 
 ### Or drive it from the CLI
 ```bash
-job_hunter            # scan all sources and score
-job_hunter add <url>  # watch a company (paste its careers URL)
-job_hunter list       # list watched sources
-job_hunter digest     # send the daily digest email
-job_hunter doctor     # diagnose keys, profile, DB, and the Groq model
+job_hunter               # scan all sources and score
+job_hunter add <url>     # watch a company (paste its careers URL)
+job_hunter list          # list watched sources
+job_hunter remove <id>   # stop watching a source (id from `list`)
+job_hunter digest        # scan, then email new matches (the 7 AM job)
+job_hunter rescore       # re-score every stored job against the current profile
+job_hunter dedupe        # merge aggregator jobs stored once per city into one row
+job_hunter compact       # trim stored raw API payloads and VACUUM the database
+job_hunter doctor        # diagnose keys, profile, DB, and the Groq model
 ```
+
+Only one scan runs at a time (`scan`, `digest`, `rescore`, `dedupe`, `compact`,
+and the web UI's Scan now share a lock file), so a cron digest can't collide
+with a scan you started by hand.
 
 ### API keys (all optional — it degrades gracefully)
 | Key | Enables | Without it |
@@ -171,7 +182,7 @@ It currently runs on a **Raspberry Pi 3B** (1 GB RAM, Raspberry Pi OS Lite 64-bi
 
 ```
 src/
-  main.rs          # CLI entry + subcommand dispatch (serve / scan / add / digest …)
+  main.rs          # CLI entry + subcommand dispatch (serve / scan / add / digest / doctor …)
   server.rs        # axum routes + JSON API for the web UI
   web/index.html   # the entire dashboard (embedded via include_str!)
   pipeline.rs      # fetch → classify → score → store orchestration
@@ -184,6 +195,7 @@ src/
   profile.rs       # the scoring profile (TOML, comment-preserving edits)
   db.rs            # SQLite schema, queries, migrations
   email.rs         # Resend digest
+  scan_lock.rs     # one-scan-at-a-time lock file shared by CLI and web
 scheduling/        # launchd (macOS) + systemd/cron (Linux) deployment
 ```
 

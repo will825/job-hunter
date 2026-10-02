@@ -1,8 +1,9 @@
 //! Job Hunter v2.
 //!
-//! Fetches jobs from watched company boards (Greenhouse, Lever, Ashby) and free
-//! aggregators (Remotive, RemoteOK), dedups, classifies, and scores each job
-//! against your profile, storing everything in local SQLite.
+//! Fetches jobs from watched company boards (Greenhouse, Lever, Ashby) and
+//! aggregators (Adzuna, Remotive, RemoteOK, Himalayas, Jobicy), dedups,
+//! classifies, and scores each job against your profile, storing everything in
+//! local SQLite.
 //!
 //! Commands:
 //!   cargo run                      scan all watched boards + print a summary
@@ -10,7 +11,11 @@
 //!   cargo run -- add <url>         watch a company board by pasting its link
 //!   cargo run -- list              list watched companies
 //!   cargo run -- remove <id>       stop watching a company (id from `list`)
+//!   cargo run -- digest            scan, then email new matches (the daily cron job)
 //!   cargo run -- rescore           re-score every stored job against the current profile
+//!   cargo run -- dedupe            merge aggregator jobs stored once per city
+//!   cargo run -- compact           trim stored raw_json and VACUUM the database
+//!   cargo run -- doctor            check keys, profile, DB, and the Groq model
 //!
 //! Robustness is deliberate: one board failing (bad token, network blip, API
 //! drift) logs a warning and the run continues — it never aborts the whole scan.

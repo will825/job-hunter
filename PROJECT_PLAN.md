@@ -1,10 +1,11 @@
 # Job Hunter v2 — Project Plan & Status
 
-A local desktop app that scans company job boards, ranks postings against your
-profile, and (soon) emails you a daily digest of new matches. Rust core, SQLite
-storage, optional local web UI, optional LLM re-ranking (Groq).
+A self-hosted job search engine that scans company job boards, ranks postings
+against your profile, and emails you a daily digest of new matches. Rust core,
+SQLite storage, embedded web UI, optional LLM re-ranking (Groq). Runs 24/7 on a
+Raspberry Pi.
 
-_Last updated: 2026-08-10._
+_Last updated: 2026-10-01. Sections below the status table are partly historical._
 
 ---
 
@@ -18,11 +19,12 @@ _Last updated: 2026-08-10._
 | 2.5 | Editable `profile.toml` drives the scoring | ✅ Done |
 | — | Coverage expansion (seed boards) + aggregators (Remotive, RemoteOK, Himalayas, Jobicy; Adzuna needs a key) | ✅ Done |
 | — | Company management: add-by-link, list, delete (CLI + web UI) | ✅ Done |
-| 3 | LLM fit-scoring (Groq) re-ranks top matches | ✅ Built — needs your Groq key to run |
+| 3 | LLM fit-scoring (Groq) re-ranks top matches | ✅ Done — fit-score tiers, quota/breaker handling |
 | 3.5 | Custom-page reader (watch any careers page) | 🟡 Partial — works for static pages; JS pages need the headless step |
-| 4 | Daily digest email + scheduling (launchd) | ✅ Built — set up `[email]` + app password to receive it |
-| 5 | Full Tauri desktop UI (your Figma design) | 🟡 Web UI slice done: profile editor (roles/skills/interests), company management, matches with AI scores + reasoning |
-| 6 | Package, sign, README, screenshots — portfolio-ready | ⬜ Not started |
+| 4 | Daily digest email (Resend) + scheduling (launchd on macOS, systemd + cron on the Pi) | ✅ Done — running daily at 7 AM |
+| 5 | Full Tauri desktop UI (your Figma design) | 🟡 Web UI done (Home triage, Swipe, Tracker, Analytics, Profile, Companies, Digest preview, Settings/Health); Tauri wrapper not started |
+| 6 | Package, sign, README, screenshots — portfolio-ready | 🟡 README + screenshots done (public repo); signed build not started |
+| — | Ops: `doctor`, `rescore`, `dedupe`, `compact`, scan lock, Health card | ✅ Done |
 
 ---
 
@@ -93,14 +95,14 @@ without touching anything else.
 
 ### 4 — Daily digest email + scheduling ✅
 - `cargo run -- digest` = scan + email the NEW apply-now/strong matches since
-  last time. Email via Gmail SMTP (`lettre`), app password from
-  `EMAIL_APP_PASSWORD`, config in `[email]`.
+  last time. Email via Resend's HTTP API, key from `RESEND_API_KEY` in `.env`,
+  config in `[email]`.
 - New-job diffing via a per-job `notified_at` column (each job emailed once); a
   one-time baseline on first run so you're not blasted with everything.
 - If email isn't set up, the digest prints instead (nothing marked sent).
 - Scheduling: `scheduling/` has a launchd plist + wrapper + `SCHEDULING.md`
-  (install steps + optional `pmset` wake). Runs while the Mac is on and logged
-  in; screen can be off.
+  for macOS, and `scheduling/linux/` has the systemd unit + Pi guide. It now
+  runs on a Raspberry Pi: `serve` as a systemd service, `digest` on a 7 AM cron.
 
 ### 5 — Full Tauri desktop UI
 - Your Figma design: pipeline board (New → To Apply → Applied → Interviewing →
@@ -128,14 +130,20 @@ cargo run -- add "https://www.theaudioprogrammer.com/jobs"   # custom page
 # see / remove watched companies
 cargo run -- list
 cargo run -- remove 7
+
+# maintenance
+cargo run -- doctor     # check keys, profile, DB, Groq model
+cargo run -- rescore    # re-score stored jobs after a profile change
+cargo run -- dedupe     # merge per-city aggregator duplicates
+cargo run -- compact    # trim stored raw_json + VACUUM
 ```
 
-To turn on LLM ranking: get a free key at console.groq.com, then
-`export GROQ_API_KEY=...` and run a scan.
+To turn on LLM ranking: get a free key at console.groq.com, put
+`GROQ_API_KEY=...` in `.env`, and run a scan.
 
 To turn on Adzuna (whole-internet search by your target roles): get free
-credentials at developer.adzuna.com, then
-`export ADZUNA_APP_ID=... ADZUNA_APP_KEY=...` and run a scan. Himalayas, Jobicy,
+credentials at developer.adzuna.com, put `ADZUNA_APP_ID` / `ADZUNA_APP_KEY` in
+`.env`, and run a scan (country and page size are in `[adzuna]`). Himalayas, Jobicy,
 Remotive, and RemoteOK aggregators need no key and are on by default.
 
 To turn on the custom-page reader: set `[custom_pages] enabled = true` in
@@ -155,4 +163,4 @@ To turn on the custom-page reader: set `[custom_pages] enabled = true` in
 
 ## Tech stack
 Rust · tokio + reqwest (async HTTP) · rusqlite (SQLite) · serde · axum (web UI)
-· toml (profile) · Groq (LLM) · headless browser + `lettre` email + Tauri (next).
+· toml (profile) · Groq (LLM) · Resend (email) · headless browser + Tauri (next).

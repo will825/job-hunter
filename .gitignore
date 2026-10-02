@@ -17,9 +17,6 @@ profile.toml
 *.scan.lock
 # Any resume files
 *.pdf
-# Cached HTML snapshots
-/jobs_snapshot.html
-jobs_snapshot.html
 
 # ── Logs ──────────────────────────────────────────────────────
 *.log

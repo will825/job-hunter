@@ -9,7 +9,8 @@ Runs 24/7 on a Raspberry Pi (systemd service + 7 AM digest cron); see `schedulin
 1. **Fetch** (async, no DB) — `pipeline::fetch_all` pulls every watched source, one at a
    time with a 250 ms pause. Per-board errors are captured, never fatal.
 2. **Store** (sync, no network) — `pipeline::store_all` runs `enrich` on each job
-   (classify work_mode/region/seniority → Stage-1 keyword score → tier), then
+   (classify work_mode/region/seniority → slim `raw_json` to `{isRemote, workplaceType, country}` →
+   Stage-1 keyword score → tier), then
    `db::upsert_job` (dedup by stable `id`, then fuzzy `dedup_key`; direct ATS beats aggregators).
    Aggregator postings re-listed per city (same `title_key` = normalized company + title, seen in
    the last 30 days) merge into one row, appending to `locations` (JSON array). ATS rows never
@@ -49,7 +50,7 @@ Watched companies, Digest email, Settings. It talks to the `/api/*` JSON routes 
 
 ## Module map
 
-- `src/main.rs` — CLI entry, `.env` loader, subcommands: (none)=scan, `serve`, `add <url>`, `list`, `remove <id>`, `digest`, `dedupe`, `rescore`, `doctor` (setup checks; runs before `db::init`, never creates files).
+- `src/main.rs` — CLI entry, `.env` loader, subcommands: (none)=scan, `serve`, `add <url>`, `list`, `remove <id>`, `digest`, `dedupe`, `rescore`, `compact` (slim raw_json + VACUUM), `doctor` (setup checks; runs before `db::init`, never creates files).
 - `src/server.rs` — axum router + JSON API handlers; binds `0.0.0.0:8787`; optional `JOBHUNTER_TOKEN` gates `/api/*` (X-Token header or `jh_token` cookie). `GET /` sends CSP + nosniff; the UI escapes all API data with `esc()`/`safeUrl()` and uses delegated listeners (no inline handlers with data).
 - `src/scan_lock.rs` — cross-process scan lock file (create_new; takeover when holder pid is dead).
 - `src/pipeline.rs` — fetch/store/prune/rescore orchestration, `full_scan`, Adzuna source expansion.
