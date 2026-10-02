@@ -1496,7 +1496,7 @@ mod tests {
             assert_eq!((d.age_days, d.age_from_posted), (Some(0), false));
         }
 
-        conn.execute("UPDATE jobs SET posted_date = date('now', '-10 days') || 'T09:30:00Z' WHERE id = ?1", [&none])
+        conn.execute("UPDATE jobs SET posted_date = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-10 days') WHERE id = ?1", [&none])
             .unwrap();
         assert_eq!(job_detail(&conn, &none).unwrap().unwrap().age_days, Some(10));
 
